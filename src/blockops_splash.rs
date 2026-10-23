@@ -4,6 +4,18 @@ use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder, RgbaImage};
 
+const FIRST_FRAME_HOLD_MS: u64 = 700;
+const SPLASH_MIN_MS: u64 = 3200;
+const SPLASH_MAX_MS: u64 = 12000;
+
+fn invert_rgb(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[0] = 255 - pixel[0];
+        pixel[1] = 255 - pixel[1];
+        pixel[2] = 255 - pixel[2];
+    }
+}
+
 pub struct BlockOpsSplash {
     started: Instant,
     frames: Vec<TextureHandle>,
@@ -59,7 +71,8 @@ impl BlockOpsSplash {
 
             let rgba: RgbaImage = frame.into_buffer();
             let size = [rgba.width() as usize, rgba.height() as usize];
-            let pixels = rgba.into_raw();
+            let mut pixels = rgba.into_raw();
+            invert_rgb(&mut pixels);
             let color_image = ColorImage::from_rgba_unmultiplied(size, &pixels);
             let texture = ctx.load_texture(
                 format!("blockops_intro_frame_{}", idx),
@@ -73,7 +86,11 @@ impl BlockOpsSplash {
         }
 
         if total_ms > 0 {
-            self.total_duration = Duration::from_millis(total_ms.min(20000).max(3500));
+            self.total_duration = Duration::from_millis(
+                total_ms
+                    .saturating_add(FIRST_FRAME_HOLD_MS)
+                    .clamp(SPLASH_MIN_MS, SPLASH_MAX_MS),
+            );
         }
     }
 
@@ -87,8 +104,6 @@ impl BlockOpsSplash {
         if self.frames.is_empty() {
             return;
         }
-
-        const FIRST_FRAME_HOLD_MS: u64 = 1500;
 
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
 
@@ -127,11 +142,10 @@ impl BlockOpsSplash {
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 let painter = ui.painter();
-                painter.rect_filled(screen, 0.0, egui::Color32::from_rgb(7, 18, 60));
+                painter.rect_filled(screen, 0.0, egui::Color32::from_rgb(7, 9, 12));
 
-                // Contain/letterbox mode: show the entire intro frame.
-                // This prevents the video/GIF from being cropped in the smaller
-                // startup window before the app maximizes.
+                // The native splash viewport is 16:9, matching the intro. Keep
+                // contain behavior as a guard for unusual Windows DPI scaling.
                 let tex_size = texture.size_vec2();
                 let scale = (screen.width() / tex_size.x).min(screen.height() / tex_size.y);
                 let drawn_size = tex_size * scale;
@@ -144,8 +158,26 @@ impl BlockOpsSplash {
                     egui::Rect::from_min_max(egui::Pos2::new(0.0, 0.0), egui::Pos2::new(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
+
+                painter.rect_stroke(
+                    screen.shrink(0.5),
+                    0.0,
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(38, 52, 66)),
+                );
             });
 
         ctx.request_repaint_after(Duration::from_millis(16));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::invert_rgb;
+
+    #[test]
+    fn inverts_rgb_and_preserves_alpha() {
+        let mut pixels = [0, 32, 255, 77, 255, 255, 255, 0];
+        invert_rgb(&mut pixels);
+        assert_eq!(pixels, [255, 223, 0, 77, 0, 0, 0, 0]);
     }
 }

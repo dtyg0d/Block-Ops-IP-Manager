@@ -1,46 +1,38 @@
-# BlockOps Static IP Manager 2.1.1
+# BlockOps Static IP Manager 3.0.0
 
-This edition uses a commercial operations-console UI and keeps rack monitoring, assignment, and site configuration in focused workspaces.
+Version 3 is a reliability and workflow rebuild of the rack monitor and static-IP
+manager.
 
-## Rack Dashboard
+## Highlights
 
-- Scan all racks or type one rack number to scan only that rack.
-- Start and stop continuous monitoring.
-- Click slots to view miner details.
-- Switch to `Assign IP` mode to arm a physical rack slot for IP Report.
-- Uses the 19-rack map from `10.4.1.1-168` through `10.4.19.1-168`.
+- The default layout is 36 racks with 168 slots, labeled Rack 1 through Rack 36.
+- Previous 19-rack settings upgrade to 36 racks; other custom counts are retained.
+- One shared start point now drives Rack 1 / Slot 1 and sequential assignment.
+- The duplicate `Rack 1, Slot 1 IP` setting was removed.
+- Direct scans over routed VPN connections do not require a relay.
+- Monitoring uses a fixed worker pool instead of creating one operating-system
+  thread per target.
+- A reachable web miner receives no more than two short vendor probes per cycle.
+- Scan concurrency is independent from static-IP apply concurrency.
+- Scan progress and elapsed time are reported in the interface.
+- Known vendor identity survives a later generic web response.
+- A known-online miner must fail two monitor cycles before it is marked offline.
+- Start/stop listener state and background jobs use typed events instead of
+  parsing status strings.
+- Pre-check results now reach the correct assignment rows.
+- Successful writes update the visible current IP immediately.
+- Settings and session output use the signed-in user's local app-data directory.
+- Non-sensitive site settings persist; miner credentials remain session-only.
+- The Windows executable explicitly runs `asInvoker` without requesting admin.
+- The animated inverted BlockOps intro opens in a dark frameless splash without
+  a loading footer.
 
-## IP Assignment
+## Optional IP Report relay
 
-- Start or stop the IP Report listener.
-- Set the first target IP and capture miners in physical order.
-- Review the assignment queue without accidentally arming redo.
-- Use the explicit `Redo selected` action when a selected row must be replaced.
-- Pre-check, apply in safe order, and export plan or result files.
+The manager does not need a relay for scans or configuration writes. The relay is
+only for physical IP Report broadcasts when a routed VPN does not carry rack-local
+broadcast traffic. Layer-2 VPN users can receive those packets directly.
 
-## Settings
+## Build output
 
-- Rack layout and address base.
-- Monitoring interval, parallel jobs, timeout, and wave delay.
-- IP Report port and wrong-subnet protection.
-- VNISH and Bitmain credentials.
-- Netmask, gateway, and DNS values.
-
-## Reliability changes
-
-- Background results repaint automatically while scans and applies run.
-- Apply batches cannot overlap; later reports queue for the next batch.
-- Successful apply steps immediately update the stored current IP.
-- Known VNISH and Bitmain miners use the matching setter directly.
-- A known-online miner requires two failed checks before being marked offline.
-- Stop Live cancels between probes and ignores late results.
-
-## Interface changes
-
-- Neutral graphite product theme with native Windows typography.
-- Exact two-rack layout without horizontal scrolling.
-- Responsive assignment controls and a structured selectable queue.
-- Unified status indicators, miner details, settings, and safety dialogs.
-- Fleet counters now live in the workspace header so a complete 168-slot rack fits onscreen.
-
-Run `build_release.bat` to create the Windows release executable.
+Run `build_release.bat` to test, build, and package the manager and optional relay.

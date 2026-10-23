@@ -1,0 +1,11 @@
+/target/
+/dist/BlockOps_Static_IP_Manager_v*.exe
+/dist/BlockOps_Static_IP_Manager_v*_Windows.zip
+/dist/BlockOps_IP_Report_Relay.exe
+/dist/README_IP_REPORT_RELAY.md
+/dist/README_V2.md
+/dist/start_ip_report_relay.bat
+*.pdb
+*.tmp
+*.log
+blockops_apply_results_*.csv

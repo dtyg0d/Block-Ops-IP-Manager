@@ -1,5 +1,22 @@
 # BlockOps Static IP Tool - Splash + Toggle Version
 
+## v3.0.0 - Operator workflow rebuild
+
+- Set the 36-rack default range to `10.3.1.1` through `10.3.36.168` and kept its editor in IP Assignment instead of duplicating it on the rack dashboard.
+- Restored plain Rack 1 through Rack 36 labels and upgraded previous 19-rack settings.
+- Replaced the separate rack-base value with the shared assignment start point.
+- Rebuilt monitoring around a bounded worker pool and lightweight vendor probes.
+- Split scan concurrency from apply concurrency and added scan progress/timing.
+- Preserved known-online state through one failed cycle and known vendor identity
+  through generic web responses.
+- Replaced string-parsed background messages with typed events.
+- Fixed pre-check results that were previously not applied to their rows.
+- Added persistent non-sensitive site settings and per-user session output paths.
+- Added an `asInvoker` Windows manifest so the app does not request elevation.
+- Kept the animated inverted title intro and optional routed-VPN IP Report relay.
+- Made the intro a dark frameless splash without the loading footer or white bars.
+- Removed the unused header-logo asset and refreshed Windows release packaging.
+
 Changes in this build:
 
 - Added first-pass Rack Map Monitor workflow:

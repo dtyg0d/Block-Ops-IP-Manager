@@ -11,18 +11,24 @@ use rfd::FileDialog;
 use serde_json::json;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::OpenOptions,
-    io::Write,
+    fs::{self, OpenOptions},
+    io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket},
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+const APP_VERSION: &str = "3.0.0";
+const DEFAULT_START_IP: &str = "10.3.1.1";
+const DEFAULT_RACK_COUNT: usize = 36;
+const SETTINGS_VERSION: u64 = 2;
+const DEFAULT_SCAN_WORKERS: usize = 64;
 const DEFAULT_NETMASK: &str = "255.255.255.0";
 const DEFAULT_DNS1: &str = "1.1.1.1";
 const DEFAULT_DNS2: &str = "8.8.8.8";
@@ -30,61 +36,78 @@ mod blockops_splash;
 use blockops_splash::BlockOpsSplash;
 
 const DEFAULT_LISTEN_PORT: u16 = 14235;
+const RELAY_PACKET_PREFIX: &[u8] = b"BLOCKOPS_RELAY_V1\n";
 const PARK_START: u8 = 168;
 const PARK_END: u8 = 240;
 
 static BLOCKOPS_APP_ICON_BYTES: &[u8] = include_bytes!("../assets/blockops_app_icon.png");
 
 fn color_app_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(10, 12, 15)
+    egui::Color32::from_rgb(8, 11, 15)
 }
 
 fn color_sidebar() -> egui::Color32 {
-    egui::Color32::from_rgb(13, 15, 19)
+    egui::Color32::from_rgb(11, 14, 19)
+}
+
+fn color_sidebar_surface() -> egui::Color32 {
+    egui::Color32::from_rgb(18, 23, 29)
+}
+
+fn color_sidebar_selected() -> egui::Color32 {
+    egui::Color32::from_rgb(17, 48, 75)
+}
+
+fn color_sidebar_text() -> egui::Color32 {
+    egui::Color32::from_rgb(241, 245, 249)
+}
+
+fn color_sidebar_muted() -> egui::Color32 {
+    egui::Color32::from_rgb(145, 158, 174)
 }
 
 fn color_surface() -> egui::Color32 {
-    egui::Color32::from_rgb(20, 23, 28)
+    egui::Color32::from_rgb(18, 23, 29)
 }
 
 fn color_surface_high() -> egui::Color32 {
-    egui::Color32::from_rgb(27, 31, 38)
+    egui::Color32::from_rgb(25, 32, 41)
 }
 
 fn color_surface_hover() -> egui::Color32 {
-    egui::Color32::from_rgb(34, 39, 48)
+    egui::Color32::from_rgb(32, 42, 53)
 }
 
 fn color_border() -> egui::Color32 {
-    egui::Color32::from_rgb(43, 49, 59)
+    egui::Color32::from_rgb(47, 58, 71)
 }
 
 fn color_text() -> egui::Color32 {
-    egui::Color32::from_rgb(238, 241, 245)
+    egui::Color32::from_rgb(241, 245, 249)
 }
 
 fn color_text_muted() -> egui::Color32 {
-    egui::Color32::from_rgb(139, 149, 163)
+    egui::Color32::from_rgb(145, 158, 174)
+}
+
+fn color_on_accent() -> egui::Color32 {
+    egui::Color32::from_rgb(255, 255, 255)
 }
 
 fn color_accent() -> egui::Color32 {
-    egui::Color32::from_rgb(49, 143, 232)
-}
-
-fn color_accent_soft() -> egui::Color32 {
-    egui::Color32::from_rgb(22, 45, 68)
+    egui::Color32::from_rgb(45, 157, 245)
 }
 
 fn color_success() -> egui::Color32 {
-    egui::Color32::from_rgb(48, 197, 139)
+    egui::Color32::from_rgb(47, 207, 148)
 }
 
 fn color_warning() -> egui::Color32 {
-    egui::Color32::from_rgb(235, 174, 60)
+    egui::Color32::from_rgb(242, 183, 67)
 }
 
 fn color_danger() -> egui::Color32 {
-    egui::Color32::from_rgb(226, 85, 103)
+    egui::Color32::from_rgb(235, 89, 112)
 }
 
 fn install_product_fonts(ctx: &egui::Context) -> egui::FontFamily {
@@ -164,31 +187,31 @@ fn configure_egui(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = color_app_bg();
     visuals.window_fill = color_surface();
-    visuals.window_stroke = egui::Stroke::new(1.0, color_border());
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, color_border());
     visuals.window_rounding = egui::Rounding::same(8.0);
     visuals.menu_rounding = egui::Rounding::same(6.0);
-    visuals.extreme_bg_color = egui::Color32::from_rgb(8, 10, 13);
-    visuals.faint_bg_color = egui::Color32::from_rgb(24, 27, 33);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(6, 9, 12);
+    visuals.faint_bg_color = egui::Color32::from_rgb(21, 27, 34);
     visuals.override_text_color = Some(color_text());
     visuals.hyperlink_color = color_accent();
     visuals.warn_fg_color = color_warning();
     visuals.error_fg_color = color_danger();
     visuals.selection.bg_fill = color_accent();
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
     visuals.widgets.noninteractive.bg_fill = color_surface();
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, color_border());
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, color_border());
     visuals.widgets.noninteractive.rounding = egui::Rounding::same(5.0);
     visuals.widgets.inactive.bg_fill = color_surface_high();
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, color_border());
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, color_border());
     visuals.widgets.inactive.rounding = egui::Rounding::same(5.0);
     visuals.widgets.hovered.bg_fill = color_surface_hover();
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, color_accent());
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, color_accent());
     visuals.widgets.hovered.rounding = egui::Rounding::same(5.0);
     visuals.widgets.active.bg_fill = color_accent();
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, color_accent());
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, color_accent());
     visuals.widgets.active.rounding = egui::Rounding::same(5.0);
     visuals.widgets.open.bg_fill = color_surface_hover();
-    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, color_accent());
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, color_accent());
     visuals.widgets.open.rounding = egui::Rounding::same(5.0);
     visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
     visuals.striped = false;
@@ -216,7 +239,7 @@ fn center_window_after_startup() {
             thread::sleep(Duration::from_millis(100));
 
             let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
-            if hwnd == std::ptr::null_mut() {
+            if hwnd.is_null() {
                 continue;
             }
 
@@ -226,9 +249,9 @@ fn center_window_after_startup() {
                     return;
                 }
 
-                // Roughly BTC-tool sized outer window.
-                let width: i32 = 1220;
-                let height: i32 = 860;
+                // Match the intro artwork so the frameless splash has no bars.
+                let width: i32 = 960;
+                let height: i32 = 540;
 
                 // Center on primary monitor.
                 let screen_w = GetSystemMetrics(SM_CXSCREEN);
@@ -284,6 +307,7 @@ struct ApplyStep {
 struct ReportPacket {
     current_ip: String,
     mac: String,
+    relayed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -293,105 +317,6 @@ struct WrongSubnetPopup {
     reported_subnet: String,
     target_ip: String,
     mac: String,
-}
-
-#[derive(Debug, Clone)]
-struct MinerApiDetails {
-    ip: String,
-    firmware: String,
-    model: String,
-    miner: String,
-    mac: String,
-    status: String,
-    pool: String,
-    hashrate: String,
-    power: String,
-    efficiency: String,
-    uptime: String,
-    temperature: String,
-    fans: String,
-    boards: String,
-    updated: String,
-    error: String,
-}
-
-impl MinerApiDetails {
-    fn loading(ip: &str) -> Self {
-        Self {
-            ip: ip.to_string(),
-            firmware: "Loading".to_string(),
-            model: "-".to_string(),
-            miner: "-".to_string(),
-            mac: "-".to_string(),
-            status: "Loading details...".to_string(),
-            pool: "-".to_string(),
-            hashrate: "-".to_string(),
-            power: "-".to_string(),
-            efficiency: "-".to_string(),
-            uptime: "-".to_string(),
-            temperature: "-".to_string(),
-            fans: "-".to_string(),
-            boards: "-".to_string(),
-            updated: Local::now().format("%H:%M:%S").to_string(),
-            error: String::new(),
-        }
-    }
-
-    fn to_wire_json(&self) -> String {
-        json!({
-            "ip": self.ip,
-            "firmware": self.firmware,
-            "model": self.model,
-            "miner": self.miner,
-            "mac": self.mac,
-            "status": self.status,
-            "pool": self.pool,
-            "hashrate": self.hashrate,
-            "power": self.power,
-            "efficiency": self.efficiency,
-            "uptime": self.uptime,
-            "temperature": self.temperature,
-            "fans": self.fans,
-            "boards": self.boards,
-            "updated": self.updated,
-            "error": self.error,
-        })
-        .to_string()
-    }
-
-    fn from_wire_json(text: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(text).ok()?;
-        let get = |key: &str| {
-            value
-                .get(key)
-                .and_then(|v| v.as_str())
-                .unwrap_or("-")
-                .to_string()
-        };
-
-        Some(Self {
-            ip: get("ip"),
-            firmware: get("firmware"),
-            model: get("model"),
-            miner: get("miner"),
-            mac: get("mac"),
-            status: get("status"),
-            pool: get("pool"),
-            hashrate: get("hashrate"),
-            power: get("power"),
-            efficiency: get("efficiency"),
-            uptime: get("uptime"),
-            temperature: get("temperature"),
-            fans: get("fans"),
-            boards: get("boards"),
-            updated: get("updated"),
-            error: value
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,32 +360,218 @@ impl SlotMonitorState {
         }
     }
 
-    fn wire(self) -> &'static str {
-        match self {
-            SlotMonitorState::Unknown => "Unknown",
-            SlotMonitorState::VnishMiner => "VnishMiner",
-            SlotMonitorState::BitmainMiner => "BitmainMiner",
-            SlotMonitorState::AuthRequired => "AuthRequired",
-            SlotMonitorState::WebOnline => "WebOnline",
-            SlotMonitorState::SshOnly => "SshOnly",
-            SlotMonitorState::Offline => "Offline",
-        }
-    }
-
-    fn from_wire(value: &str) -> Self {
-        match value {
-            "VnishMiner" => SlotMonitorState::VnishMiner,
-            "BitmainMiner" => SlotMonitorState::BitmainMiner,
-            "AuthRequired" => SlotMonitorState::AuthRequired,
-            "WebOnline" => SlotMonitorState::WebOnline,
-            "SshOnly" => SlotMonitorState::SshOnly,
-            "Offline" => SlotMonitorState::Offline,
-            _ => SlotMonitorState::Unknown,
-        }
-    }
-
     fn is_present(self) -> bool {
         !matches!(self, SlotMonitorState::Unknown | SlotMonitorState::Offline)
+    }
+}
+
+#[derive(Debug)]
+enum BackgroundEvent {
+    Status(String),
+    ListenerReady(u16),
+    ListenerStopped,
+    ListenerFailed(String),
+    PrecheckResult { row_line: usize, result: String },
+    ApplyStepStatus { order: usize, status: String },
+    ApplySequenceDone,
+    MonitorCycleStarted { total: usize },
+    MonitorResult { ip: String, state: SlotMonitorState },
+    MonitorCycleDone { elapsed_ms: u128 },
+    MonitorDone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SitePreferences {
+    start_ip: String,
+    rack_count: usize,
+    rack_size: usize,
+    scan_workers: usize,
+    monitor_interval_secs: u64,
+    apply_workers: usize,
+    apply_timeout_secs: u64,
+    apply_delay_secs: u64,
+    listen_port: u16,
+    auto_apply_armed_reports: bool,
+    reject_wrong_subnet_reports: bool,
+    netmask: String,
+    gateway_override: String,
+    dns1: String,
+    dns2: String,
+}
+
+impl Default for SitePreferences {
+    fn default() -> Self {
+        Self {
+            start_ip: DEFAULT_START_IP.to_string(),
+            rack_count: DEFAULT_RACK_COUNT,
+            rack_size: 168,
+            scan_workers: DEFAULT_SCAN_WORKERS,
+            monitor_interval_secs: 30,
+            apply_workers: 12,
+            apply_timeout_secs: 8,
+            apply_delay_secs: 2,
+            listen_port: DEFAULT_LISTEN_PORT,
+            auto_apply_armed_reports: true,
+            reject_wrong_subnet_reports: true,
+            netmask: DEFAULT_NETMASK.to_string(),
+            gateway_override: String::new(),
+            dns1: DEFAULT_DNS1.to_string(),
+            dns2: DEFAULT_DNS2.to_string(),
+        }
+    }
+}
+
+impl SitePreferences {
+    fn path() -> PathBuf {
+        app_data_dir().join("settings.json")
+    }
+
+    fn load() -> Self {
+        let preferences = Self::default();
+        let Ok(text) = fs::read_to_string(Self::path()) else {
+            return preferences;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return preferences;
+        };
+
+        Self::from_value(&value)
+    }
+
+    fn from_value(value: &serde_json::Value) -> Self {
+        let mut preferences = Self::default();
+
+        let string_value = |key: &str| {
+            value
+                .get(key)
+                .and_then(|item| item.as_str())
+                .map(str::to_string)
+        };
+        let usize_value = |key: &str| {
+            value
+                .get(key)
+                .and_then(|item| item.as_u64())
+                .and_then(|item| usize::try_from(item).ok())
+        };
+
+        if let Some(start_ip) = string_value("start_ip").filter(|ip| valid_ip(ip)) {
+            preferences.start_ip = start_ip;
+        }
+        preferences.rack_count = usize_value("rack_count")
+            .unwrap_or(preferences.rack_count)
+            .clamp(1, 40);
+        // Upgrade the previous site layout once, while preserving later edits.
+        if value
+            .get("version")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0)
+            < SETTINGS_VERSION
+            && preferences.rack_count == 19
+        {
+            preferences.rack_count = DEFAULT_RACK_COUNT;
+        }
+        preferences.rack_size = usize_value("rack_size")
+            .unwrap_or(preferences.rack_size)
+            .clamp(1, 168);
+        preferences.scan_workers = usize_value("scan_workers")
+            .unwrap_or(preferences.scan_workers)
+            .clamp(1, 128);
+        preferences.monitor_interval_secs = value
+            .get("monitor_interval_secs")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(preferences.monitor_interval_secs)
+            .clamp(5, 600);
+        preferences.apply_workers = usize_value("apply_workers")
+            .unwrap_or(preferences.apply_workers)
+            .clamp(1, 64);
+        preferences.apply_timeout_secs = value
+            .get("apply_timeout_secs")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(preferences.apply_timeout_secs)
+            .clamp(3, 120);
+        preferences.apply_delay_secs = value
+            .get("apply_delay_secs")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(preferences.apply_delay_secs)
+            .clamp(0, 60);
+        preferences.listen_port = value
+            .get("listen_port")
+            .and_then(|item| item.as_u64())
+            .and_then(|item| u16::try_from(item).ok())
+            .filter(|port| *port > 0)
+            .unwrap_or(preferences.listen_port);
+        preferences.auto_apply_armed_reports = value
+            .get("auto_apply_armed_reports")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(preferences.auto_apply_armed_reports);
+        preferences.reject_wrong_subnet_reports = value
+            .get("reject_wrong_subnet_reports")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(preferences.reject_wrong_subnet_reports);
+        if let Some(netmask) = string_value("netmask").filter(|ip| valid_ip(ip)) {
+            preferences.netmask = netmask;
+        }
+        if let Some(gateway) = string_value("gateway_override") {
+            if gateway.is_empty() || valid_ip(&gateway) {
+                preferences.gateway_override = gateway;
+            }
+        }
+        if let Some(dns1) = string_value("dns1").filter(|ip| valid_ip(ip)) {
+            preferences.dns1 = dns1;
+        }
+        if let Some(dns2) = string_value("dns2").filter(|ip| valid_ip(ip)) {
+            preferences.dns2 = dns2;
+        }
+
+        preferences
+    }
+
+    fn save(&self) -> Result<(), String> {
+        let path = Self::path();
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Settings path has no parent directory".to_string())?;
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let payload = json!({
+            "version": SETTINGS_VERSION,
+            "start_ip": self.start_ip,
+            "rack_count": self.rack_count,
+            "rack_size": self.rack_size,
+            "scan_workers": self.scan_workers,
+            "monitor_interval_secs": self.monitor_interval_secs,
+            "apply_workers": self.apply_workers,
+            "apply_timeout_secs": self.apply_timeout_secs,
+            "apply_delay_secs": self.apply_delay_secs,
+            "listen_port": self.listen_port,
+            "auto_apply_armed_reports": self.auto_apply_armed_reports,
+            "reject_wrong_subnet_reports": self.reject_wrong_subnet_reports,
+            "netmask": self.netmask,
+            "gateway_override": self.gateway_override,
+            "dns1": self.dns1,
+            "dns2": self.dns2,
+        });
+        let text = serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?;
+        fs::write(path, text).map_err(|error| error.to_string())
+    }
+}
+
+fn merge_monitor_state(
+    previous: Option<SlotMonitorState>,
+    observed: SlotMonitorState,
+) -> SlotMonitorState {
+    if observed == SlotMonitorState::WebOnline
+        && matches!(
+            previous,
+            Some(
+                SlotMonitorState::VnishMiner
+                    | SlotMonitorState::BitmainMiner
+                    | SlotMonitorState::AuthRequired
+            )
+        )
+    {
+        previous.unwrap_or(observed)
+    } else {
+        observed
     }
 }
 
@@ -503,6 +614,56 @@ fn valid_ip(ip: &str) -> bool {
 
 fn parse_ipv4(ip: &str) -> Option<Ipv4Addr> {
     ip.trim().parse::<Ipv4Addr>().ok()
+}
+
+fn rack_slot_ip(
+    start_ip: Ipv4Addr,
+    rack: usize,
+    slot: usize,
+    rack_size: usize,
+) -> Option<Ipv4Addr> {
+    if rack == 0 || slot == 0 || slot > rack_size {
+        return None;
+    }
+
+    let octets = start_ip.octets();
+    let third = (octets[2] as usize).checked_add(rack - 1)?;
+    let fourth = (octets[3] as usize).checked_add(slot - 1)?;
+    if third > 254 || fourth > 254 {
+        return None;
+    }
+
+    Some(Ipv4Addr::new(
+        octets[0],
+        octets[1],
+        third as u8,
+        fourth as u8,
+    ))
+}
+
+fn app_data_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("BlockOps").join("Static IP Manager")
+}
+
+fn writable_session_dir() -> PathBuf {
+    let preferred = app_data_dir().join("Sessions");
+    if fs::create_dir_all(&preferred).is_ok() {
+        return preferred;
+    }
+
+    let fallback = std::env::temp_dir()
+        .join("BlockOps")
+        .join("Static IP Manager")
+        .join("Sessions");
+    let _ = fs::create_dir_all(&fallback);
+    fallback
+}
+
+fn session_file_path(root: &Path, stem: &str, extension: &str, timestamp: &str) -> PathBuf {
+    root.join(format!("{}_{}.{}", stem, timestamp, extension))
 }
 
 fn next_ipv4(ip: Ipv4Addr) -> Option<Ipv4Addr> {
@@ -559,11 +720,30 @@ fn gateway_for_target_with_override(
 }
 
 fn parse_report_packet(data: &[u8], sender_ip: &str) -> ReportPacket {
-    let text = String::from_utf8_lossy(data).to_string();
+    let (payload, effective_sender, relayed) =
+        if let Some(rest) = data.strip_prefix(RELAY_PACKET_PREFIX) {
+            if let Some(newline) = rest.iter().position(|byte| *byte == b'\n') {
+                let reported_sender = std::str::from_utf8(&rest[..newline])
+                    .ok()
+                    .map(str::trim)
+                    .filter(|ip| valid_ip(ip));
+                if let Some(reported_sender) = reported_sender {
+                    (&rest[newline + 1..], reported_sender.to_string(), true)
+                } else {
+                    (data, sender_ip.to_string(), false)
+                }
+            } else {
+                (data, sender_ip.to_string(), false)
+            }
+        } else {
+            (data, sender_ip.to_string(), false)
+        };
+
+    let text = String::from_utf8_lossy(payload).to_string();
     let ip_re = Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").unwrap();
     let mac_re = Regex::new(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b").unwrap();
 
-    let mut current_ip = sender_ip.to_string();
+    let mut current_ip = effective_sender;
     let mut mac = String::new();
 
     if let Some(m) = ip_re.find(&text) {
@@ -577,7 +757,11 @@ fn parse_report_packet(data: &[u8], sender_ip: &str) -> ReportPacket {
         mac = normalize_mac(m.as_str());
     }
 
-    ReportPacket { current_ip, mac }
+    ReportPacket {
+        current_ip,
+        mac,
+        relayed,
+    }
 }
 
 fn md5_hex(input: &str) -> String {
@@ -854,19 +1038,37 @@ fn post_cgi_with_auth(
     }
 }
 
+#[derive(Clone, Copy)]
+struct NetworkWriteConfig<'a> {
+    netmask: &'a str,
+    dns1: &'a str,
+    dns2: &'a str,
+    gateway_override: &'a str,
+    timeout_secs: u64,
+}
+
+#[derive(Clone, Copy)]
+struct MinerCredentials<'a> {
+    stock_user: &'a str,
+    stock_password: &'a str,
+    vnish_password: &'a str,
+}
+
 fn apply_stock_hiveon_static(
     current_ip: &str,
     target_ip: &str,
     username: &str,
     password: &str,
-    netmask: &str,
-    dns1: &str,
-    gateway_override: &str,
-    timeout_secs: u64,
+    config: &NetworkWriteConfig<'_>,
 ) -> Result<(), String> {
     let uri = "/cgi-bin/set_network_conf.cgi";
     // Official newer Bitmain docs use JSON fields on this same endpoint.
-    let json_body = bitmain_stock_json_body(target_ip, netmask, dns1, gateway_override)?;
+    let json_body = bitmain_stock_json_body(
+        target_ip,
+        config.netmask,
+        config.dns1,
+        config.gateway_override,
+    )?;
 
     let json_result = post_cgi_with_auth(
         current_ip,
@@ -875,7 +1077,7 @@ fn apply_stock_hiveon_static(
         password,
         "application/json",
         &json_body,
-        timeout_secs.max(15),
+        config.timeout_secs.max(15),
     );
 
     if json_result.is_ok() {
@@ -884,7 +1086,12 @@ fn apply_stock_hiveon_static(
 
     // Older Bitmain/Hiveon-style CGI scripts use form fields beginning with _ant_conf_*.
     // Keep this fallback so the same mode works across older stock, Hiveon stock-like, and newer stock.
-    let form_body = stock_hiveon_form_body(target_ip, netmask, dns1, gateway_override)?;
+    let form_body = stock_hiveon_form_body(
+        target_ip,
+        config.netmask,
+        config.dns1,
+        config.gateway_override,
+    )?;
     let form_result = post_cgi_with_auth(
         current_ip,
         uri,
@@ -892,7 +1099,7 @@ fn apply_stock_hiveon_static(
         password,
         "application/x-www-form-urlencoded",
         &form_body,
-        timeout_secs.max(15),
+        config.timeout_secs.max(15),
     );
 
     match form_result {
@@ -910,14 +1117,8 @@ fn apply_static_by_mode(
     current_ip: &str,
     mac: &str,
     target_ip: &str,
-    stock_user: &str,
-    stock_password: &str,
-    vnish_password: &str,
-    netmask: &str,
-    dns1: &str,
-    dns2: &str,
-    gateway_override: &str,
-    timeout_secs: u64,
+    credentials: &MinerCredentials<'_>,
+    config: &NetworkWriteConfig<'_>,
 ) -> Result<(), String> {
     let mode = firmware_mode.to_lowercase();
 
@@ -926,12 +1127,8 @@ fn apply_static_by_mode(
             current_ip,
             mac,
             target_ip,
-            vnish_password,
-            netmask,
-            dns1,
-            dns2,
-            gateway_override,
-            timeout_secs,
+            credentials.vnish_password,
+            config,
         );
     }
 
@@ -939,12 +1136,9 @@ fn apply_static_by_mode(
         return apply_stock_hiveon_static(
             current_ip,
             target_ip,
-            stock_user,
-            stock_password,
-            netmask,
-            dns1,
-            gateway_override,
-            timeout_secs.max(15),
+            credentials.stock_user,
+            credentials.stock_password,
+            config,
         );
     }
 
@@ -953,17 +1147,16 @@ fn apply_static_by_mode(
     // 2. If VNISH does not accept it, try Bitmain Stock/Hiveon CGI.
     //
     // Keep the VNISH probe short so a mixed rack does not waste tons of time on stock units.
-    let vnish_timeout = timeout_secs.min(5).max(3);
+    let vnish_config = NetworkWriteConfig {
+        timeout_secs: config.timeout_secs.clamp(3, 5),
+        ..*config
+    };
     let vnish_result = apply_vnish_static(
         current_ip,
         mac,
         target_ip,
-        vnish_password,
-        netmask,
-        dns1,
-        dns2,
-        gateway_override,
-        vnish_timeout,
+        credentials.vnish_password,
+        &vnish_config,
     );
 
     if vnish_result.is_ok() {
@@ -977,12 +1170,9 @@ fn apply_static_by_mode(
     let stock_result = apply_stock_hiveon_static(
         current_ip,
         target_ip,
-        stock_user,
-        stock_password,
-        netmask,
-        dns1,
-        gateway_override,
-        timeout_secs.max(15),
+        credentials.stock_user,
+        credentials.stock_password,
+        config,
     );
 
     match stock_result {
@@ -1020,13 +1210,9 @@ fn apply_vnish_static(
     mac: &str,
     target_ip: &str,
     password: &str,
-    netmask: &str,
-    dns1: &str,
-    dns2: &str,
-    gateway_override: &str,
-    timeout_secs: u64,
+    config: &NetworkWriteConfig<'_>,
 ) -> Result<(), String> {
-    let token = get_token(current_ip, password, timeout_secs)?;
+    let token = get_token(current_ip, password, config.timeout_secs)?;
     let url = format!("http://{}/api/v1/settings", current_ip);
 
     let hostname = if mac.is_empty() {
@@ -1035,22 +1221,22 @@ fn apply_vnish_static(
         format!("miner-{}", normalize_mac(mac).replace(':', "-"))
     };
 
-    let gateway = gateway_for_target_with_override(target_ip, gateway_override)?;
+    let gateway = gateway_for_target_with_override(target_ip, config.gateway_override)?;
 
     let payload = json!({
         "network": {
             "hostname": hostname,
             "dhcp": false,
             "ipaddress": target_ip,
-            "netmask": netmask,
+            "netmask": config.netmask,
             "gateway": gateway,
-            "dnsservers": [dns1, dns2],
+            "dnsservers": [config.dns1, config.dns2],
             "enable_network_check": false
         }
     });
 
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(timeout_secs))
+        .timeout(Duration::from_secs(config.timeout_secs))
         .build();
 
     agent
@@ -1066,7 +1252,7 @@ fn apply_vnish_static(
 fn http_status_code(current_ip: &str, path: &str, timeout_secs: u64) -> Option<u16> {
     let url = format!("http://{}{}", current_ip, path);
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(timeout_secs.max(2).min(10)))
+        .timeout(Duration::from_secs(timeout_secs.clamp(2, 10)))
         .build();
 
     match agent.get(&url).call() {
@@ -1085,36 +1271,33 @@ fn tcp_port_open(ip: &str, port: u16, timeout_ms: u64) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(timeout_ms)).is_ok()
 }
 
-fn http_status_code_ms(current_ip: &str, path: &str, timeout_ms: u64) -> Option<u16> {
-    let url = format!("http://{}{}", current_ip, path);
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(timeout_ms.max(250).min(5000)))
-        .build();
-
-    match agent.get(&url).call() {
-        Ok(response) => Some(response.status()),
-        Err(ureq::Error::Status(code, _)) => Some(code),
-        Err(_) => None,
-    }
+fn monitor_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(700))
+        .build()
 }
 
-fn http_get_text_ms(current_ip: &str, path: &str, timeout_ms: u64) -> Result<(u16, String), u16> {
+fn monitor_http_get(agent: &ureq::Agent, current_ip: &str, path: &str) -> Option<(u16, String)> {
     let url = format!("http://{}{}", current_ip, path);
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(timeout_ms.max(250).min(5000)))
-        .build();
-
     match agent.get(&url).call() {
         Ok(response) => {
             let code = response.status();
-            let body = response.into_string().unwrap_or_default();
-            Ok((code, body))
+            let mut body = String::new();
+            let _ = response
+                .into_reader()
+                .take(64 * 1024)
+                .read_to_string(&mut body);
+            Some((code, body))
         }
         Err(ureq::Error::Status(code, response)) => {
-            let body = response.into_string().unwrap_or_default();
-            Ok((code, body))
+            let mut body = String::new();
+            let _ = response
+                .into_reader()
+                .take(64 * 1024)
+                .read_to_string(&mut body);
+            Some((code, body))
         }
-        Err(_) => Err(0),
+        Err(_) => None,
     }
 }
 
@@ -1130,329 +1313,89 @@ fn body_looks_like_vnish_miner(body: &str) -> bool {
         || lower.contains("neopool")
 }
 
-fn probe_vnish_api(ip: &str, stop: Option<&AtomicBool>) -> Option<SlotMonitorState> {
-    for path in [
-        "/api/v1/status",
-        "/api/v1/info",
-        "/api/v1/model",
-        "/api/v1/summary",
-    ] {
-        if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            return None;
-        }
-
-        match http_get_text_ms(ip, path, 1200) {
-            Ok((401 | 403, _)) => return Some(SlotMonitorState::AuthRequired),
-            Ok((200, body)) if body_looks_like_vnish_miner(&body) => {
-                return Some(SlotMonitorState::VnishMiner);
-            }
-            Ok(_) => continue,
-            Err(_) => continue,
-        }
-    }
-
-    None
-}
-
-fn probe_bitmain_cgi(ip: &str, stop: Option<&AtomicBool>) -> Option<SlotMonitorState> {
-    for path in [
-        "/cgi-bin/get_network_info.cgi",
-        "/cgi-bin/get_system_info.cgi",
-        "/cgi-bin/summary.cgi",
-        "/cgi-bin/minerStatus.cgi",
-        "/cgi-bin/set_network_conf.cgi",
-    ] {
-        if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            return None;
-        }
-
-        match http_status_code_ms(ip, path, 1200) {
-            Some(200) | Some(401) | Some(403) => return Some(SlotMonitorState::BitmainMiner),
-            _ => continue,
-        }
-    }
-
-    None
-}
-
-fn discover_monitor_state_with_stop(ip: &str, stop: Option<&AtomicBool>) -> SlotMonitorState {
-    let http_open = tcp_port_open(ip, 80, 500);
-    if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+fn discover_monitor_state(agent: &ureq::Agent, ip: &str, stop: &AtomicBool) -> SlotMonitorState {
+    let http_open = tcp_port_open(ip, 80, 300);
+    if stop.load(Ordering::Relaxed) {
         return SlotMonitorState::Unknown;
     }
-    let ssh_open = tcp_port_open(ip, 22, 500);
 
     if !http_open {
-        return if ssh_open {
+        if tcp_port_open(ip, 443, 250) {
+            return SlotMonitorState::WebOnline;
+        }
+        return if tcp_port_open(ip, 22, 300) {
             SlotMonitorState::SshOnly
         } else {
             SlotMonitorState::Offline
         };
     }
 
-    if let Some(state) = probe_vnish_api(ip, stop) {
-        return state;
+    if let Some((status, body)) = monitor_http_get(agent, ip, "/api/v1/status") {
+        match status {
+            401 | 403 => return SlotMonitorState::AuthRequired,
+            200 if body_looks_like_vnish_miner(&body) => {
+                return SlotMonitorState::VnishMiner;
+            }
+            _ => {}
+        }
     }
 
-    if let Some(state) = probe_bitmain_cgi(ip, stop) {
-        return state;
+    if stop.load(Ordering::Relaxed) {
+        return SlotMonitorState::Unknown;
+    }
+
+    if let Some((200 | 401 | 403, _)) = monitor_http_get(agent, ip, "/cgi-bin/get_system_info.cgi")
+    {
+        return SlotMonitorState::BitmainMiner;
     }
 
     SlotMonitorState::WebOnline
 }
 
-fn discover_monitor_state(ip: &str) -> SlotMonitorState {
-    discover_monitor_state_with_stop(ip, None)
-}
+fn run_monitor_cycle(
+    targets: Arc<Vec<String>>,
+    worker_count: usize,
+    tx: Sender<BackgroundEvent>,
+    stop: Arc<AtomicBool>,
+) -> u128 {
+    let started = Instant::now();
+    let next_index = Arc::new(AtomicUsize::new(0));
+    let workers = worker_count.max(1).min(targets.len().max(1));
+    let mut handles = Vec::with_capacity(workers);
 
-fn json_find_string(value: &serde_json::Value, names: &[&str]) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, val) in map {
-                if names.iter().any(|name| key.eq_ignore_ascii_case(name)) {
-                    if let Some(s) = val.as_str() {
-                        if !s.trim().is_empty() {
-                            return Some(s.trim().to_string());
-                        }
-                    } else if val.is_number() || val.is_boolean() {
-                        return Some(val.to_string());
-                    }
+    for _ in 0..workers {
+        let worker_targets = targets.clone();
+        let worker_index = next_index.clone();
+        let worker_tx = tx.clone();
+        let worker_stop = stop.clone();
+        handles.push(thread::spawn(move || {
+            let agent = monitor_http_agent();
+            loop {
+                if worker_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let index = worker_index.fetch_add(1, Ordering::Relaxed);
+                let Some(ip) = worker_targets.get(index) else {
+                    break;
+                };
+
+                let state = discover_monitor_state(&agent, ip, worker_stop.as_ref());
+                if !worker_stop.load(Ordering::Relaxed) {
+                    let _ = worker_tx.send(BackgroundEvent::MonitorResult {
+                        ip: ip.clone(),
+                        state,
+                    });
                 }
             }
-
-            for val in map.values() {
-                if let Some(found) = json_find_string(val, names) {
-                    return Some(found);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for val in items {
-                if let Some(found) = json_find_string(val, names) {
-                    return Some(found);
-                }
-            }
-        }
-        _ => {}
+        }));
     }
 
-    None
-}
-
-fn json_find_number(value: &serde_json::Value, names: &[&str]) -> Option<f64> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, val) in map {
-                if names.iter().any(|name| key.eq_ignore_ascii_case(name)) {
-                    if let Some(n) = val.as_f64() {
-                        return Some(n);
-                    }
-                    if let Some(s) = val.as_str() {
-                        if let Ok(n) = s.replace(',', "").parse::<f64>() {
-                            return Some(n);
-                        }
-                    }
-                }
-            }
-
-            for val in map.values() {
-                if let Some(found) = json_find_number(val, names) {
-                    return Some(found);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for val in items {
-                if let Some(found) = json_find_number(val, names) {
-                    return Some(found);
-                }
-            }
-        }
-        _ => {}
+    for handle in handles {
+        let _ = handle.join();
     }
 
-    None
-}
-
-fn first_non_dash(values: &[Option<String>]) -> String {
-    values
-        .iter()
-        .flatten()
-        .find(|s| !s.trim().is_empty() && s.trim() != "-")
-        .cloned()
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn format_uptime(seconds: f64) -> String {
-    let seconds = seconds.max(0.0) as u64;
-    let days = seconds / 86_400;
-    let hours = (seconds % 86_400) / 3_600;
-    let minutes = (seconds % 3_600) / 60;
-
-    if days > 0 {
-        format!("{}d {}h", days, hours)
-    } else if hours > 0 {
-        format!("{}h {}m", hours, minutes)
-    } else {
-        format!("{}m", minutes)
-    }
-}
-
-fn format_hashrate(value: f64) -> String {
-    if value <= 0.0 {
-        return "-".to_string();
-    }
-
-    if value > 1_000_000.0 {
-        format!("{:.2} TH/s", value / 1_000_000.0)
-    } else if value > 1_000.0 {
-        format!("{:.2} TH/s", value / 1_000.0)
-    } else {
-        format!("{:.2} TH/s", value)
-    }
-}
-
-fn details_from_json(
-    ip: &str,
-    values: &[serde_json::Value],
-    fallback_state: SlotMonitorState,
-) -> MinerApiDetails {
-    let pick_string = |names: &[&str]| -> String {
-        first_non_dash(
-            &values
-                .iter()
-                .map(|value| json_find_string(value, names))
-                .collect::<Vec<_>>(),
-        )
-    };
-
-    let pick_number = |names: &[&str]| -> Option<f64> {
-        values
-            .iter()
-            .find_map(|value| json_find_number(value, names))
-    };
-
-    let model = pick_string(&["model", "model_id", "platform", "miner_type", "type"]);
-    let miner = pick_string(&["miner", "miner_name", "device", "hostname", "ipHost"]);
-    let firmware = pick_string(&["firmware", "fw_version", "version", "build", "system"]);
-    let mac = pick_string(&["mac", "macaddr", "mac_address", "ethaddr"]);
-    let status = pick_string(&["status", "miner_status", "state", "miner_state"]);
-    let pool = pick_string(&["pool", "pool_url", "url", "active_pool"]);
-
-    let hashrate = pick_number(&[
-        "hashrate",
-        "hashrate_5s",
-        "hashrate_avg",
-        "GHS 5s",
-        "GHS av",
-        "rate_5s",
-    ])
-    .map(format_hashrate)
-    .unwrap_or_else(|| pick_string(&["hashrate", "GHS 5s", "GHS av"]));
-
-    let power = pick_number(&["power", "power_consumption", "watt", "watts", "consumption"])
-        .map(|n| format!("{:.0} W", n))
-        .unwrap_or_else(|| pick_string(&["power", "power_consumption", "consumption"]));
-
-    let efficiency = pick_number(&["efficiency", "j_th", "j/ths", "w_th"])
-        .map(|n| format!("{:.1} J/TH", n))
-        .unwrap_or_else(|| pick_string(&["efficiency", "j_th", "j/ths", "w_th"]));
-
-    let uptime = pick_number(&["uptime", "elapsed", "Elapsed"])
-        .map(format_uptime)
-        .unwrap_or_else(|| pick_string(&["uptime", "elapsed", "Elapsed"]));
-
-    let temperature = pick_number(&["temperature", "temp", "temp_max", "chip_temp", "pcb_temp"])
-        .map(|n| format!("{:.0} C", n))
-        .unwrap_or_else(|| pick_string(&["temperature", "temp", "temp_max"]));
-
-    let fans = pick_string(&["fans", "fan", "fan_num", "fan_speed", "fan1", "fan2"]);
-    let boards = pick_string(&["boards", "chains", "chain_num", "hashboard_count"]);
-
-    MinerApiDetails {
-        ip: ip.to_string(),
-        firmware: if firmware == "-" {
-            fallback_state.label().to_string()
-        } else {
-            firmware
-        },
-        model,
-        miner,
-        mac,
-        status: if status == "-" {
-            fallback_state.label().to_string()
-        } else {
-            status
-        },
-        pool,
-        hashrate,
-        power,
-        efficiency,
-        uptime,
-        temperature,
-        fans,
-        boards,
-        updated: Local::now().format("%H:%M:%S").to_string(),
-        error: String::new(),
-    }
-}
-
-fn fetch_miner_api_details(ip: &str) -> MinerApiDetails {
-    let state = discover_monitor_state(ip);
-    let mut values = Vec::new();
-    let mut errors = Vec::new();
-
-    for path in [
-        "/api/v1/status",
-        "/api/v1/info",
-        "/api/v1/model",
-        "/api/v1/summary",
-        "/api/v1/chains",
-    ] {
-        match http_get_text_ms(ip, path, 1500) {
-            Ok((200, body)) => {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-                    values.push(value);
-                }
-            }
-            Ok((401 | 403, _)) => {}
-            Ok((code, _)) => errors.push(format!("{} HTTP {}", path, code)),
-            Err(_) => {}
-        }
-    }
-
-    for path in [
-        "/cgi-bin/get_network_info.cgi",
-        "/cgi-bin/get_system_info.cgi",
-        "/cgi-bin/summary.cgi",
-        "/cgi-bin/minerStatus.cgi",
-    ] {
-        match http_get_text_ms(ip, path, 1500) {
-            Ok((200, body)) => {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-                    values.push(value);
-                }
-            }
-            Ok((401 | 403, _)) => {}
-            Ok((code, _)) => errors.push(format!("{} HTTP {}", path, code)),
-            Err(_) => {}
-        }
-    }
-
-    if values.is_empty() {
-        let mut details = MinerApiDetails::loading(ip);
-        details.firmware = state.label().to_string();
-        details.status = state.label().to_string();
-        details.updated = Local::now().format("%H:%M:%S").to_string();
-        details.error = if errors.is_empty() {
-            "No readable API detail response.".to_string()
-        } else {
-            errors.join("; ")
-        };
-        return details;
-    }
-
-    details_from_json(ip, &values, state)
+    started.elapsed().as_millis()
 }
 
 fn precheck_vnish(
@@ -1460,13 +1403,13 @@ fn precheck_vnish(
     vnish_password: &str,
     timeout_secs: u64,
 ) -> Result<String, String> {
-    match get_token(current_ip, vnish_password, timeout_secs.max(3).min(8)) {
+    match get_token(current_ip, vnish_password, timeout_secs.clamp(3, 8)) {
         Ok(_) => Ok("VNISH API OK".to_string()),
         Err(e) => {
-            if vnish_password != "root" {
-                if get_token(current_ip, "root", timeout_secs.max(3).min(8)).is_ok() {
-                    return Ok("VNISH API OK with root".to_string());
-                }
+            if vnish_password != "root"
+                && get_token(current_ip, "root", timeout_secs.clamp(3, 8)).is_ok()
+            {
+                return Ok("VNISH API OK with root".to_string());
             }
             Err(format!("VNISH auth/API failed: {}", e))
         }
@@ -1492,7 +1435,7 @@ fn precheck_stock_hiveon(
     ];
 
     for ep in endpoints {
-        if let Some(code) = http_status_code(current_ip, ep, timeout_secs.max(3).min(8)) {
+        if let Some(code) = http_status_code(current_ip, ep, timeout_secs.clamp(3, 8)) {
             if matches!(code, 200..=299) {
                 return Ok(format!("Stock/Hiveon CGI reachable ({}) HTTP {}", ep, code));
             }
@@ -1517,7 +1460,7 @@ fn precheck_any_firmware(
         return "PRECHECK skipped: invalid/unfilled current IP".to_string();
     }
 
-    let root_status = http_status_code(current_ip, "/", timeout_secs.max(2).min(5));
+    let root_status = http_status_code(current_ip, "/", timeout_secs.clamp(2, 5));
     if root_status.is_none() {
         return "PRECHECK FAIL: no web response".to_string();
     }
@@ -1539,20 +1482,23 @@ fn precheck_any_firmware(
 fn spawn_udp_listener(
     port: u16,
     tx: Sender<ReportPacket>,
-    status_tx: Sender<String>,
+    status_tx: Sender<BackgroundEvent>,
     stop_flag: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let socket = match UdpSocket::bind(("0.0.0.0", port)) {
             Ok(s) => s,
             Err(e) => {
-                let _ = status_tx.send(format!("Could not bind UDP {}: {}", port, e));
+                let _ = status_tx.send(BackgroundEvent::ListenerFailed(format!(
+                    "Could not bind UDP {}: {}",
+                    port, e
+                )));
                 return;
             }
         };
 
         let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
-        let _ = status_tx.send(format!("Listening for IP reports on UDP {}", port));
+        let _ = status_tx.send(BackgroundEvent::ListenerReady(port));
         let mut buf = [0u8; 4096];
 
         while !stop_flag.load(Ordering::Relaxed) {
@@ -1565,7 +1511,7 @@ fn spawn_udp_listener(
             }
         }
 
-        let _ = status_tx.send("IP report listener stopped.".to_string());
+        let _ = status_tx.send(BackgroundEvent::ListenerStopped);
     });
 }
 
@@ -1582,11 +1528,8 @@ struct BlockOpsApp {
     start_ip_input: String,
     next_target_ip: Option<Ipv4Addr>,
     skip_reason_input: String,
-    rack_one_slot_one_ip: String,
     rack_count: usize,
     rack_size: usize,
-    edit_rack_map: bool,
-    selected_detail_slot: Option<(usize, usize)>,
     selected_rack_slot: Option<(usize, usize)>,
     armed_target_ip: Option<String>,
     auto_apply_armed_reports: bool,
@@ -1597,12 +1540,14 @@ struct BlockOpsApp {
     monitor_stop: Option<Arc<AtomicBool>>,
     monitor_interval_secs: u64,
     monitor_rack_input: String,
+    scan_workers: usize,
+    monitor_completed: usize,
+    monitor_total: usize,
+    monitor_last_cycle_ms: Option<u128>,
     monitor_results: HashMap<String, SlotMonitorState>,
     monitor_failure_streaks: HashMap<String, u8>,
     monitor_last_checked: HashMap<String, String>,
     monitor_last_seen: HashMap<String, String>,
-    miner_details: HashMap<String, MinerApiDetails>,
-    details_loading: HashSet<String>,
 
     vnish_password: String,
     stock_user: String,
@@ -1621,16 +1566,19 @@ struct BlockOpsApp {
 
     report_rx: Receiver<ReportPacket>,
     report_tx: Sender<ReportPacket>,
-    status_rx: Receiver<String>,
-    status_tx: Sender<String>,
+    status_rx: Receiver<BackgroundEvent>,
+    status_tx: Sender<BackgroundEvent>,
 
     listener_started: bool,
+    listener_starting: bool,
     listener_stop: Option<Arc<AtomicBool>>,
     status: String,
     log_path: String,
     apply_results_path: String,
+    saved_preferences: SitePreferences,
 
     splash_done: bool,
+    maximize_after_splash: bool,
     blockops_splash: BlockOpsSplash,
 
     selected_line: Option<usize>,
@@ -1644,6 +1592,10 @@ impl Default for BlockOpsApp {
     fn default() -> Self {
         let (report_tx, report_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();
+        let session_dir = writable_session_dir();
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let preferences = SitePreferences::load();
+        let start_ip = parse_ipv4(&preferences.start_ip);
 
         Self {
             active_view: AppView::RackDashboard,
@@ -1655,44 +1607,43 @@ impl Default for BlockOpsApp {
             assigned_macs: HashSet::new(),
             assigned_target_ips: HashSet::new(),
 
-            start_ip_input: "".to_string(),
-            next_target_ip: None,
+            start_ip_input: preferences.start_ip.clone(),
+            next_target_ip: start_ip,
             skip_reason_input: "No report".to_string(),
-            rack_one_slot_one_ip: "10.4.1.1".to_string(),
-            rack_count: 19,
-            rack_size: 168,
-            edit_rack_map: false,
-            selected_detail_slot: None,
+            rack_count: preferences.rack_count,
+            rack_size: preferences.rack_size,
             selected_rack_slot: None,
             armed_target_ip: None,
-            auto_apply_armed_reports: true,
+            auto_apply_armed_reports: preferences.auto_apply_armed_reports,
             apply_running: false,
             apply_queued: false,
             monitor_running: false,
             monitor_live: false,
             monitor_stop: None,
-            monitor_interval_secs: 30,
+            monitor_interval_secs: preferences.monitor_interval_secs,
             monitor_rack_input: "1".to_string(),
+            scan_workers: preferences.scan_workers,
+            monitor_completed: 0,
+            monitor_total: 0,
+            monitor_last_cycle_ms: None,
             monitor_results: HashMap::new(),
             monitor_failure_streaks: HashMap::new(),
             monitor_last_checked: HashMap::new(),
             monitor_last_seen: HashMap::new(),
-            miner_details: HashMap::new(),
-            details_loading: HashSet::new(),
 
             vnish_password: "admin".to_string(),
             stock_user: "root".to_string(),
             stock_password: "root".to_string(),
-            netmask: DEFAULT_NETMASK.to_string(),
-            dns1: DEFAULT_DNS1.to_string(),
-            dns2: DEFAULT_DNS2.to_string(),
-            gateway_override: String::new(),
-            timeout_secs: 8,
-            apply_delay_secs: 2,
-            parallel_jobs: 12,
-            listen_port: DEFAULT_LISTEN_PORT,
+            netmask: preferences.netmask.clone(),
+            dns1: preferences.dns1.clone(),
+            dns2: preferences.dns2.clone(),
+            gateway_override: preferences.gateway_override.clone(),
+            timeout_secs: preferences.apply_timeout_secs,
+            apply_delay_secs: preferences.apply_delay_secs,
+            parallel_jobs: preferences.apply_workers,
+            listen_port: preferences.listen_port,
 
-            reject_wrong_subnet_reports: true,
+            reject_wrong_subnet_reports: preferences.reject_wrong_subnet_reports,
             wrong_subnet_popup: None,
 
             report_rx,
@@ -1701,18 +1652,24 @@ impl Default for BlockOpsApp {
             status_tx,
 
             listener_started: false,
+            listener_starting: false,
             listener_stop: None,
             status: "Ready. Choose Rack Dashboard or IP Assignment to begin.".to_string(),
-            log_path: format!(
-                "blockops_static_ip_{}.log",
-                Local::now().format("%Y%m%d_%H%M%S")
-            ),
-            apply_results_path: format!(
-                "blockops_apply_results_{}.csv",
-                Local::now().format("%Y%m%d_%H%M%S")
-            ),
+            log_path: session_file_path(&session_dir, "blockops_static_ip", "log", &timestamp)
+                .to_string_lossy()
+                .into_owned(),
+            saved_preferences: preferences,
+            apply_results_path: session_file_path(
+                &session_dir,
+                "blockops_apply_results",
+                "csv",
+                &timestamp,
+            )
+            .to_string_lossy()
+            .into_owned(),
 
             splash_done: false,
+            maximize_after_splash: false,
             blockops_splash: BlockOpsSplash::default(),
 
             selected_line: None,
@@ -1735,10 +1692,55 @@ impl BlockOpsApp {
         }
     }
 
+    fn current_preferences(&self) -> Option<SitePreferences> {
+        if !valid_ip(&self.start_ip_input)
+            || !valid_ip(&self.netmask)
+            || !valid_ip(&self.dns1)
+            || !valid_ip(&self.dns2)
+            || (!self.gateway_override.trim().is_empty() && !valid_ip(self.gateway_override.trim()))
+        {
+            return None;
+        }
+
+        Some(SitePreferences {
+            start_ip: self.start_ip_input.trim().to_string(),
+            rack_count: self.rack_count,
+            rack_size: self.rack_size,
+            scan_workers: self.scan_workers,
+            monitor_interval_secs: self.monitor_interval_secs,
+            apply_workers: self.parallel_jobs,
+            apply_timeout_secs: self.timeout_secs,
+            apply_delay_secs: self.apply_delay_secs,
+            listen_port: self.listen_port,
+            auto_apply_armed_reports: self.auto_apply_armed_reports,
+            reject_wrong_subnet_reports: self.reject_wrong_subnet_reports,
+            netmask: self.netmask.trim().to_string(),
+            gateway_override: self.gateway_override.trim().to_string(),
+            dns1: self.dns1.trim().to_string(),
+            dns2: self.dns2.trim().to_string(),
+        })
+    }
+
+    fn persist_preferences_if_changed(&mut self) {
+        let Some(preferences) = self.current_preferences() else {
+            return;
+        };
+        if preferences == self.saved_preferences {
+            return;
+        }
+
+        if let Err(error) = preferences.save() {
+            self.log(&format!("Could not save settings: {}", error));
+        }
+        self.saved_preferences = preferences;
+    }
+
     fn set_start_ip(&mut self) {
         match parse_ipv4(&self.start_ip_input) {
             Some(ip) => {
                 self.next_target_ip = Some(ip);
+                self.selected_rack_slot = None;
+                self.armed_target_ip = None;
                 self.status = format!("Next target IP set to {}", ip);
                 self.log(&self.status);
             }
@@ -1747,22 +1749,8 @@ impl BlockOpsApp {
     }
 
     fn rack_slot_target_ip(&self, rack: usize, slot: usize) -> Option<String> {
-        if rack == 0 || slot == 0 || slot > self.rack_size {
-            return None;
-        }
-
-        let base = parse_ipv4(&self.rack_one_slot_one_ip)?;
-        let mut o = base.octets();
-        let rack_offset = rack.checked_sub(1)?;
-        let third = (o[2] as usize).checked_add(rack_offset)?;
-
-        if third > 254 || slot > 254 {
-            return None;
-        }
-
-        o[2] = third as u8;
-        o[3] = slot as u8;
-        Some(Ipv4Addr::new(o[0], o[1], o[2], o[3]).to_string())
+        let start_ip = parse_ipv4(&self.start_ip_input)?;
+        rack_slot_ip(start_ip, rack, slot, self.rack_size).map(|ip| ip.to_string())
     }
 
     fn monitor_counts(&self) -> MonitorCounts {
@@ -1803,12 +1791,15 @@ impl BlockOpsApp {
     fn arm_rack_slot(&mut self, rack: usize, slot: usize) {
         let Some(target_ip) = self.rack_slot_target_ip(rack, slot) else {
             self.status =
-                "Rack map IP rule is invalid. Check Rack 1 Slot 1 IP and rack size.".to_string();
+                "Rack map IP rule is invalid. Check the start point and rack size.".to_string();
             return;
         };
 
+        if !self.listener_started && !self.listener_starting {
+            self.toggle_listener();
+        }
+
         self.selected_rack_slot = Some((rack, slot));
-        self.selected_detail_slot = Some((rack, slot));
         self.armed_target_ip = Some(target_ip.clone());
         self.status = format!(
             "Armed Rack {} Slot {} for {}. Press IP Report on that physical miner.",
@@ -1937,23 +1928,26 @@ impl BlockOpsApp {
             return;
         }
 
-        let parallel_jobs = self.parallel_jobs.max(1).min(128);
+        let scan_workers = self.scan_workers.clamp(1, 128);
         let tx = self.status_tx.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let interval_secs = self.monitor_interval_secs.max(5);
+        let targets = Arc::new(targets);
         self.monitor_running = true;
         self.monitor_live = continuous;
         self.monitor_stop = Some(stop);
+        self.monitor_completed = 0;
+        self.monitor_total = targets.len();
         self.status = format!(
-            "{} started for {} rack slots with {} parallel checks{}.",
+            "{} started for {} rack slots with {} lightweight workers{}.",
             if continuous {
                 "Live monitor"
             } else {
                 "Monitor scan"
             },
             targets.len(),
-            parallel_jobs,
+            scan_workers,
             rack_only
                 .map(|rack| format!(" on Rack {}", rack))
                 .unwrap_or_default()
@@ -1961,36 +1955,23 @@ impl BlockOpsApp {
 
         thread::spawn(move || {
             loop {
-                for chunk in targets.chunks(parallel_jobs) {
-                    if stop_thread.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let mut handles = Vec::new();
-
-                    for ip in chunk.iter().cloned() {
-                        let tx_slot = tx.clone();
-                        let stop_slot = stop_thread.clone();
-                        handles.push(thread::spawn(move || {
-                            let state =
-                                discover_monitor_state_with_stop(&ip, Some(stop_slot.as_ref()));
-                            if !stop_slot.load(Ordering::Relaxed) {
-                                let _ =
-                                    tx_slot.send(format!("MONITOR_RESULT|{}|{}", ip, state.wire()));
-                            }
-                        }));
-                    }
-
-                    for handle in handles {
-                        let _ = handle.join();
-                    }
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
                 }
+                let _ = tx.send(BackgroundEvent::MonitorCycleStarted {
+                    total: targets.len(),
+                });
+                let elapsed_ms = run_monitor_cycle(
+                    targets.clone(),
+                    scan_workers,
+                    tx.clone(),
+                    stop_thread.clone(),
+                );
+                let _ = tx.send(BackgroundEvent::MonitorCycleDone { elapsed_ms });
 
                 if !continuous || stop_thread.load(Ordering::Relaxed) {
                     break;
                 }
-
-                let _ = tx.send("MONITOR_CYCLE_DONE".to_string());
 
                 for _ in 0..interval_secs {
                     if stop_thread.load(Ordering::Relaxed) {
@@ -1999,7 +1980,7 @@ impl BlockOpsApp {
                     thread::sleep(Duration::from_secs(1));
                 }
             }
-            let _ = tx.send("MONITOR_DONE".to_string());
+            let _ = tx.send(BackgroundEvent::MonitorDone);
         });
     }
 
@@ -2007,192 +1988,6 @@ impl BlockOpsApp {
         if let Some(flag) = &self.monitor_stop {
             flag.store(true, Ordering::Relaxed);
             self.status = "Stopping live monitor...".to_string();
-        }
-    }
-
-    fn select_rack_slot_details(&mut self, rack: usize, slot: usize) {
-        self.selected_detail_slot = Some((rack, slot));
-        self.selected_rack_slot = Some((rack, slot));
-        let target = self
-            .rack_slot_target_ip(rack, slot)
-            .unwrap_or_else(|| "invalid".to_string());
-        self.status = format!("Viewing Rack {} Slot {} ({})", rack, slot, target);
-        if valid_ip(&target) {
-            self.request_miner_details(target);
-        }
-    }
-
-    fn request_miner_details(&mut self, ip: String) {
-        if self.details_loading.contains(&ip) {
-            return;
-        }
-
-        self.details_loading.insert(ip.clone());
-        self.miner_details
-            .entry(ip.clone())
-            .or_insert_with(|| MinerApiDetails::loading(&ip));
-
-        let tx = self.status_tx.clone();
-        thread::spawn(move || {
-            let details = fetch_miner_api_details(&ip);
-            let _ = tx.send(format!("DETAIL_RESULT|{}|{}", ip, details.to_wire_json()));
-        });
-    }
-
-    fn render_miner_detail_popup(&mut self, ctx: &egui::Context) {
-        if self.edit_rack_map {
-            return;
-        }
-
-        let Some((rack, slot)) = self.selected_detail_slot else {
-            return;
-        };
-
-        let target_ip = self
-            .rack_slot_target_ip(rack, slot)
-            .unwrap_or_else(|| "invalid".to_string());
-        let monitor_state = self
-            .monitor_results
-            .get(&target_ip)
-            .copied()
-            .unwrap_or(SlotMonitorState::Unknown);
-        let assignment = self.slot_assignment(&target_ip).cloned();
-        let details = self
-            .miner_details
-            .get(&target_ip)
-            .cloned()
-            .unwrap_or_else(|| MinerApiDetails::loading(&target_ip));
-        let last_checked = self
-            .monitor_last_checked
-            .get(&target_ip)
-            .cloned()
-            .unwrap_or_else(|| "-".to_string());
-        let last_seen = self
-            .monitor_last_seen
-            .get(&target_ip)
-            .cloned()
-            .unwrap_or_else(|| "-".to_string());
-
-        let mut open = true;
-        egui::Window::new("Miner details")
-            .id(egui::Id::new("miner_detail_window"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(390.0)
-            .show(ctx, |ui| {
-                ui.set_min_width(370.0);
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(if details.model == "-" {
-                                    "Miner".to_string()
-                                } else {
-                                    details.model.clone()
-                                })
-                                .size(18.0)
-                                .strong()
-                                .color(color_text()),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Rack {:02}  /  Slot {:03}  /  {}",
-                                    rack, slot, target_ip
-                                ))
-                                .small()
-                                .color(color_text_muted()),
-                            );
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            status_badge(
-                                ui,
-                                monitor_state.label(),
-                                monitor_state_color(monitor_state),
-                            );
-                        });
-                    });
-
-                    ui.add_space(10.0);
-                    ui.columns(2, |columns| {
-                        detail_metric(&mut columns[0], "HASHRATE", &details.hashrate);
-                        detail_metric(&mut columns[1], "POWER", &details.power);
-                    });
-                    ui.add_space(6.0);
-                    ui.columns(2, |columns| {
-                        detail_metric(&mut columns[0], "EFFICIENCY", &details.efficiency);
-                        detail_metric(&mut columns[1], "UPTIME", &details.uptime);
-                    });
-                    ui.add_space(6.0);
-                    ui.columns(3, |columns| {
-                        detail_metric(&mut columns[0], "TEMP", &details.temperature);
-                        detail_metric(&mut columns[1], "BOARDS", &details.boards);
-                        detail_metric(&mut columns[2], "FANS", &details.fans);
-                    });
-
-                    ui.add_space(12.0);
-                    section_label(ui, "DEVICE");
-                    ui.add_space(4.0);
-                    let mac = assignment
-                        .as_ref()
-                        .map(|row| row.mac.as_str())
-                        .filter(|mac| !mac.is_empty())
-                        .unwrap_or(&details.mac);
-                    egui::Grid::new("miner_detail_grid")
-                        .num_columns(2)
-                        .spacing(egui::vec2(22.0, 7.0))
-                        .show(ui, |ui| {
-                            detail_row(ui, "Firmware", &details.firmware);
-                            detail_row(ui, "Status", &details.status);
-                            detail_row(ui, "Pool", &details.pool);
-                            detail_row(ui, "IP address", &target_ip);
-                            detail_row(ui, "MAC address", mac);
-                            detail_row(ui, "Last seen", &last_seen);
-                            detail_row(ui, "Last checked", &last_checked);
-                            detail_row(ui, "API updated", &details.updated);
-                        });
-
-                    if !details.error.is_empty() {
-                        ui.add_space(8.0);
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(49, 38, 20))
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                color_warning().linear_multiply(0.55),
-                            ))
-                            .rounding(egui::Rounding::same(5.0))
-                            .inner_margin(egui::Margin::symmetric(9.0, 7.0))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(&details.error)
-                                        .small()
-                                        .color(color_warning()),
-                                );
-                            });
-                    }
-
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("↻  Refresh").clicked() && valid_ip(&target_ip) {
-                            self.request_miner_details(target_ip.clone());
-                        }
-                        if ui.button("⧉  Copy IP").clicked() {
-                            ui.ctx().output_mut(|o| {
-                                o.copied_text = target_ip.clone();
-                            });
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Close").clicked() {
-                                self.selected_detail_slot = None;
-                            }
-                        });
-                    });
-                });
-            });
-
-        if !open {
-            self.selected_detail_slot = None;
         }
     }
 
@@ -2626,7 +2421,10 @@ impl BlockOpsApp {
                             timeout,
                         );
 
-                        let _ = tx_step.send(format!("APPLY_RESULT|{}|{}", step.row_line, result));
+                        let _ = tx_step.send(BackgroundEvent::PrecheckResult {
+                            row_line: step.row_line,
+                            result,
+                        });
                     }));
                 }
 
@@ -2635,10 +2433,10 @@ impl BlockOpsApp {
                 }
             }
 
-            let _ = tx.send(
+            let _ = tx.send(BackgroundEvent::Status(
                 "Pre-check finished. Review Apply column before running Apply Safe Order."
                     .to_string(),
-            );
+            ));
         });
     }
 
@@ -3047,7 +2845,23 @@ impl BlockOpsApp {
                         let gateway_override = gateway_override.clone();
 
                         handles.push(thread::spawn(move || {
-                            let _ = tx_step.send(format!("STEP_STATUS|{}|Applying...", step.order));
+                            let _ = tx_step.send(BackgroundEvent::ApplyStepStatus {
+                                order: step.order,
+                                status: "Applying...".to_string(),
+                            });
+
+                            let credentials = MinerCredentials {
+                                stock_user: &stock_user,
+                                stock_password: &stock_password,
+                                vnish_password: &vnish_password,
+                            };
+                            let network_config = NetworkWriteConfig {
+                                netmask: &netmask,
+                                dns1: &dns1,
+                                dns2: &dns2,
+                                gateway_override: &gateway_override,
+                                timeout_secs: timeout,
+                            };
 
                             let result = std::panic::catch_unwind(|| {
                                 apply_static_by_mode(
@@ -3055,26 +2869,23 @@ impl BlockOpsApp {
                                     &step.current_ip,
                                     &step.mac,
                                     &step.target_ip,
-                                    &stock_user,
-                                    &stock_password,
-                                    &vnish_password,
-                                    &netmask,
-                                    &dns1,
-                                    &dns2,
-                                    &gateway_override,
-                                    timeout,
+                                    &credentials,
+                                    &network_config,
                                 )
                             })
                             .unwrap_or_else(|_| {
                                 Err("Apply worker stopped unexpectedly".to_string())
                             });
 
-                            let msg = match result {
-                                Ok(_) => format!("STEP_STATUS|{}|SUCCESS", step.order),
-                                Err(e) => format!("STEP_STATUS|{}|{}", step.order, e),
+                            let status = match result {
+                                Ok(_) => "SUCCESS".to_string(),
+                                Err(e) => e,
                             };
 
-                            let _ = tx_step.send(msg);
+                            let _ = tx_step.send(BackgroundEvent::ApplyStepStatus {
+                                order: step.order,
+                                status,
+                            });
                         }));
                     }
 
@@ -3088,7 +2899,7 @@ impl BlockOpsApp {
                 }
             }
 
-            let _ = tx.send("APPLY_SEQUENCE_DONE".to_string());
+            let _ = tx.send(BackgroundEvent::ApplySequenceDone);
         });
 
         self.status = format!(
@@ -3099,11 +2910,12 @@ impl BlockOpsApp {
     }
 
     fn toggle_listener(&mut self) {
-        if self.listener_started {
+        if self.listener_started || self.listener_starting {
             if let Some(flag) = &self.listener_stop {
                 flag.store(true, Ordering::Relaxed);
             }
             self.listener_started = false;
+            self.listener_starting = false;
             self.listener_stop = None;
             self.status = "Stopping IP report listener...".to_string();
         } else {
@@ -3115,61 +2927,98 @@ impl BlockOpsApp {
                 stop.clone(),
             );
             self.listener_stop = Some(stop);
-            self.listener_started = true;
+            self.listener_starting = true;
+            self.status = format!("Starting IP Report listener on UDP {}...", self.listen_port);
         }
     }
 
     fn poll_channels(&mut self) {
         while let Ok(report) = self.report_rx.try_recv() {
+            if report.relayed {
+                self.log(&format!(
+                    "IP Report received through VPN relay from {}.",
+                    report.current_ip
+                ));
+            }
             self.add_miner(report.current_ip.clone(), report.mac.clone());
         }
 
-        while let Ok(msg) = self.status_rx.try_recv() {
-            if let Some(rest) = msg.strip_prefix("STEP_STATUS|") {
-                let parts: Vec<&str> = rest.splitn(2, '|').collect();
-                if parts.len() == 2 {
-                    if let Ok(order) = parts[0].parse::<usize>() {
-                        let mut successful_move = None;
-                        if let Some(step) = self.apply_steps.iter_mut().find(|s| s.order == order) {
-                            step.status = parts[1].to_string();
-                            if parts[1] == "SUCCESS" {
-                                successful_move = Some((step.row_line, step.target_ip.clone()));
-                            }
+        while let Ok(event) = self.status_rx.try_recv() {
+            match event {
+                BackgroundEvent::Status(message) => self.status = message,
+                BackgroundEvent::ListenerReady(port) => {
+                    self.listener_starting = false;
+                    self.listener_started = true;
+                    self.status = format!("Listening for IP reports on UDP {}.", port);
+                }
+                BackgroundEvent::ListenerStopped => {
+                    self.listener_starting = false;
+                    self.listener_started = false;
+                    self.listener_stop = None;
+                    self.status = "IP Report listener stopped.".to_string();
+                }
+                BackgroundEvent::ListenerFailed(error) => {
+                    self.listener_starting = false;
+                    self.listener_started = false;
+                    self.listener_stop = None;
+                    self.status = error;
+                }
+                BackgroundEvent::PrecheckResult { row_line, result } => {
+                    if let Some(step) = self
+                        .apply_steps
+                        .iter_mut()
+                        .find(|step| step.row_line == row_line)
+                    {
+                        step.status = result.clone();
+                    }
+                    self.log(&format!("Pre-check row {}: {}", row_line, result));
+                    self.sync_apply_steps_to_rows();
+                }
+                BackgroundEvent::ApplyStepStatus { order, status } => {
+                    let mut successful_move = None;
+                    if let Some(step) = self.apply_steps.iter_mut().find(|step| step.order == order)
+                    {
+                        step.status = status.clone();
+                        if status == "SUCCESS" {
+                            successful_move = Some((step.row_line, step.target_ip.clone()));
                         }
-                        if let Some((row_line, new_ip)) = successful_move {
-                            if let Some(row) = self.rows.iter_mut().find(|row| row.line == row_line)
-                            {
-                                row.current_ip = new_ip;
-                                row.status = "Static IP accepted by miner".to_string();
-                            }
-                            self.rebuild_assignment_sets();
+                    }
+                    if let Some((row_line, new_ip)) = successful_move {
+                        if let Some(row) = self.rows.iter_mut().find(|row| row.line == row_line) {
+                            row.current_ip = new_ip;
+                            row.status = "Static IP accepted by miner".to_string();
                         }
-                        self.log(&format!("Apply step {} status: {}", order, parts[1]));
-                        self.sync_apply_steps_to_rows();
-                        self.autosave_apply_results();
+                        self.rebuild_assignment_sets();
+                    }
+                    self.log(&format!("Apply step {} status: {}", order, status));
+                    self.sync_apply_steps_to_rows();
+                    self.autosave_apply_results();
+                }
+                BackgroundEvent::ApplySequenceDone => {
+                    self.apply_running = false;
+                    if self.apply_queued {
+                        self.apply_queued = false;
+                        self.status =
+                            "Apply batch finished. Starting queued changes...".to_string();
+                        self.apply_safe_order();
+                    } else {
+                        self.status = "Apply sequence finished.".to_string();
                     }
                 }
-            } else if msg == "APPLY_SEQUENCE_DONE" {
-                self.apply_running = false;
-                if self.apply_queued {
-                    self.apply_queued = false;
-                    self.status = "Apply batch finished. Starting queued changes...".to_string();
-                    self.apply_safe_order();
-                } else {
-                    self.status = "Apply sequence finished.".to_string();
+                BackgroundEvent::MonitorCycleStarted { total } => {
+                    self.monitor_completed = 0;
+                    self.monitor_total = total;
                 }
-            } else if let Some(rest) = msg.strip_prefix("MONITOR_RESULT|") {
-                let parts: Vec<&str> = rest.splitn(2, '|').collect();
-                if parts.len() == 2 {
-                    let ip = parts[0].to_string();
-                    let state = SlotMonitorState::from_wire(parts[1]);
+                BackgroundEvent::MonitorResult { ip, state } => {
+                    self.monitor_completed = self
+                        .monitor_completed
+                        .saturating_add(1)
+                        .min(self.monitor_total);
                     let now = Local::now().format("%H:%M:%S").to_string();
                     self.monitor_last_checked.insert(ip.clone(), now.clone());
 
-                    let previous_was_present = self
-                        .monitor_results
-                        .get(&ip)
-                        .is_some_and(|previous| previous.is_present());
+                    let previous = self.monitor_results.get(&ip).copied();
+                    let previous_was_present = previous.is_some_and(|value| value.is_present());
                     let hold_previous_state = state == SlotMonitorState::Offline
                         && previous_was_present
                         && *self
@@ -3180,53 +3029,43 @@ impl BlockOpsApp {
                             < 2;
 
                     if !hold_previous_state {
-                        self.monitor_results.insert(ip.clone(), state);
+                        self.monitor_results
+                            .insert(ip.clone(), merge_monitor_state(previous, state));
                     }
 
                     if state.is_present() {
                         self.monitor_failure_streaks.remove(&ip);
-                        self.monitor_last_seen.insert(ip.clone(), now);
+                        self.monitor_last_seen.insert(ip, now);
                     } else if !previous_was_present {
                         self.monitor_failure_streaks.remove(&ip);
                     }
-
-                    let selected_ip = self
-                        .selected_detail_slot
-                        .and_then(|(rack, slot)| self.rack_slot_target_ip(rack, slot));
-                    if selected_ip.as_deref() == Some(ip.as_str())
-                        && state.is_present()
-                        && !self.details_loading.contains(&ip)
-                    {
-                        self.request_miner_details(ip);
+                }
+                BackgroundEvent::MonitorCycleDone { elapsed_ms } => {
+                    self.monitor_last_cycle_ms = Some(elapsed_ms);
+                    if self.monitor_live {
+                        self.status = format!(
+                            "Live monitor updated in {:.1}s. Next scan in {} seconds.",
+                            elapsed_ms as f64 / 1_000.0,
+                            self.monitor_interval_secs.max(5)
+                        );
                     }
                 }
-            } else if let Some(rest) = msg.strip_prefix("DETAIL_RESULT|") {
-                let parts: Vec<&str> = rest.splitn(2, '|').collect();
-                if parts.len() == 2 {
-                    self.details_loading.remove(parts[0]);
-                    if let Some(details) = MinerApiDetails::from_wire_json(parts[1]) {
-                        self.miner_details.insert(parts[0].to_string(), details);
-                    }
+                BackgroundEvent::MonitorDone => {
+                    let was_live = self.monitor_live;
+                    self.monitor_running = false;
+                    self.monitor_live = false;
+                    self.monitor_stop = None;
+                    self.status = if was_live {
+                        "Live monitor stopped.".to_string()
+                    } else if let Some(elapsed_ms) = self.monitor_last_cycle_ms {
+                        format!(
+                            "Monitor scan finished in {:.1}s.",
+                            elapsed_ms as f64 / 1_000.0
+                        )
+                    } else {
+                        "Monitor scan finished.".to_string()
+                    };
                 }
-            } else if msg == "MONITOR_DONE" {
-                let was_live = self.monitor_live;
-                self.monitor_running = false;
-                self.monitor_live = false;
-                self.monitor_stop = None;
-                self.status = if was_live {
-                    "Live monitor stopped.".to_string()
-                } else {
-                    "Monitor scan finished.".to_string()
-                };
-            } else if msg == "MONITOR_CYCLE_DONE" {
-                if self.monitor_live {
-                    self.status = format!(
-                        "Live monitor updated. Next scan in {} seconds.",
-                        self.monitor_interval_secs.max(5)
-                    );
-                }
-            } else {
-                self.status = msg;
             }
         }
     }
@@ -3234,65 +3073,144 @@ impl BlockOpsApp {
     fn render_rack_panel(&self, ui: &mut egui::Ui, rack: usize) -> Option<usize> {
         let mut clicked_slot = None;
         let columns = 12usize;
-        let rows_per_rack = (self.rack_size + columns - 1) / columns;
-        let online_count = (1..=self.rack_size)
-            .filter_map(|slot| self.rack_slot_target_ip(rack, slot))
-            .filter(|ip| {
-                self.monitor_results
-                    .get(ip)
-                    .copied()
-                    .unwrap_or(SlotMonitorState::Unknown)
-                    .is_present()
-            })
-            .count();
+        let rows_per_rack = self.rack_size.div_ceil(columns);
+        let mut online_count = 0usize;
+        let mut offline_count = 0usize;
+        for slot in 1..=self.rack_size {
+            let Some(ip) = self.rack_slot_target_ip(rack, slot) else {
+                continue;
+            };
+            match self
+                .monitor_results
+                .get(&ip)
+                .copied()
+                .unwrap_or(SlotMonitorState::Unknown)
+            {
+                state if state.is_present() => online_count += 1,
+                SlotMonitorState::Offline => offline_count += 1,
+                _ => {}
+            }
+        }
+        let unknown_count = self
+            .rack_size
+            .saturating_sub(online_count.saturating_add(offline_count));
+        let rack_start = self.rack_slot_target_ip(rack, 1).unwrap_or_default();
+        let rack_end = self
+            .rack_slot_target_ip(rack, self.rack_size)
+            .unwrap_or_default();
+        let health_color = if online_count + offline_count == 0 {
+            color_text_muted()
+        } else if offline_count == 0 {
+            color_success()
+        } else if online_count == 0 {
+            color_danger()
+        } else {
+            color_warning()
+        };
 
         egui::Frame::none()
             .fill(color_surface())
-            .stroke(egui::Stroke::new(1.0, color_border()))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                if online_count + offline_count == 0 {
+                    color_border()
+                } else {
+                    health_color.linear_multiply(0.72)
+                },
+            ))
             .rounding(egui::Rounding::same(7.0))
             .inner_margin(egui::Margin::same(10.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Rack {:02}", rack))
-                            .size(15.0)
-                            .strong()
-                            .color(color_text()),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.vertical(|ui| {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "{} / {} online",
-                                online_count, self.rack_size
-                            ))
-                            .small()
-                            .color(
-                                if online_count == self.rack_size {
-                                    color_success()
-                                } else {
-                                    color_text_muted()
-                                },
-                            ),
+                            egui::RichText::new(format!("Rack {}", rack))
+                                .size(14.0)
+                                .strong()
+                                .color(color_text()),
                         );
+                        ui.label(
+                            egui::RichText::new(format!("{}  —  {}", rack_start, rack_end))
+                                .size(11.5)
+                                .strong()
+                                .color(color_text()),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.vertical(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} / {} online",
+                                            online_count, self.rack_size
+                                        ))
+                                        .small()
+                                        .strong()
+                                        .color(health_color),
+                                    );
+                                    status_dot(ui, health_color);
+                                },
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let detail = if online_count + offline_count == 0 {
+                                        "Not scanned".to_string()
+                                    } else {
+                                        format!(
+                                            "{} offline  ·  {} unscanned",
+                                            offline_count, unknown_count
+                                        )
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(detail)
+                                            .size(10.0)
+                                            .color(color_text_muted()),
+                                    );
+                                },
+                            );
+                        });
                     });
                 });
 
-                let progress = if self.rack_size == 0 {
-                    0.0
-                } else {
-                    online_count as f32 / self.rack_size as f32
-                };
                 let (bar_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 3.0),
+                    egui::vec2(ui.available_width(), 4.0),
                     egui::Sense::hover(),
                 );
                 ui.painter()
-                    .rect_filled(bar_rect, egui::Rounding::same(1.5), color_surface_high());
-                if progress > 0.0 {
-                    let mut fill_rect = bar_rect;
-                    fill_rect.max.x = fill_rect.min.x + bar_rect.width() * progress;
-                    ui.painter()
-                        .rect_filled(fill_rect, egui::Rounding::same(1.5), color_success());
+                    .rect_filled(bar_rect, egui::Rounding::same(2.0), color_surface_high());
+                if self.rack_size > 0 {
+                    let online_width =
+                        bar_rect.width() * online_count as f32 / self.rack_size as f32;
+                    let offline_width =
+                        bar_rect.width() * offline_count as f32 / self.rack_size as f32;
+                    if online_width > 0.0 {
+                        let online_rect = egui::Rect::from_min_max(
+                            bar_rect.min,
+                            egui::pos2(bar_rect.min.x + online_width, bar_rect.max.y),
+                        );
+                        ui.painter().rect_filled(
+                            online_rect,
+                            egui::Rounding::same(2.0),
+                            color_success(),
+                        );
+                    }
+                    if offline_width > 0.0 {
+                        let offline_rect = egui::Rect::from_min_max(
+                            egui::pos2(bar_rect.min.x + online_width, bar_rect.min.y),
+                            egui::pos2(
+                                bar_rect.min.x + online_width + offline_width,
+                                bar_rect.max.y,
+                            ),
+                        );
+                        ui.painter().rect_filled(
+                            offline_rect,
+                            egui::Rounding::same(2.0),
+                            color_danger(),
+                        );
+                    }
                 }
                 ui.add_space(5.0);
 
@@ -3300,6 +3218,7 @@ impl BlockOpsApp {
                 let slot_width = ((ui.available_width() - slot_gap * 11.0) / 12.0)
                     .floor()
                     .max(18.0);
+                ui.spacing_mut().interact_size.y = 20.0;
                 egui::Grid::new(format!("rack_grid_{}", rack))
                     .spacing(egui::vec2(slot_gap, 3.0))
                     .min_col_width(0.0)
@@ -3353,18 +3272,20 @@ impl BlockOpsApp {
                                         SlotMonitorState::Unknown => color_surface_high(),
                                     }
                                 };
-                                let text_color = if monitor_state == SlotMonitorState::Unknown
-                                    && assignment.is_none()
-                                    && !selected
+                                let text_color = if selected {
+                                    color_text()
+                                } else if (monitor_state == SlotMonitorState::Unknown
+                                    && assignment.is_none())
+                                    || assignment.is_some_and(|row| row.current_ip == "SKIPPED")
                                 {
                                     color_text_muted()
                                 } else {
-                                    color_text()
+                                    color_on_accent()
                                 };
                                 let stroke = if selected {
-                                    egui::Stroke::new(2.0, color_text())
+                                    egui::Stroke::new(2.0_f32, color_text())
                                 } else {
-                                    egui::Stroke::new(1.0, fill.linear_multiply(1.12))
+                                    egui::Stroke::new(1.0_f32, fill.linear_multiply(1.12))
                                 };
                                 let response = slot_cell(
                                     ui,
@@ -3430,28 +3351,31 @@ impl BlockOpsApp {
             });
 
         if let Some((rack, slot)) = clicked_slot {
-            if self.edit_rack_map {
-                self.arm_rack_slot(rack, slot);
-            } else {
-                self.select_rack_slot_details(rack, slot);
-            }
+            self.arm_rack_slot(rack, slot);
         }
     }
 
     fn render_dashboard_toolbar(&mut self, ui: &mut egui::Ui) {
         egui::Frame::none()
             .fill(color_surface())
-            .stroke(egui::Stroke::new(1.0, color_border()))
+            .stroke(egui::Stroke::new(1.0_f32, color_border()))
             .rounding(egui::Rounding::same(7.0))
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    let scan_all_label = if self.monitor_results.is_empty() {
+                        "↻  Scan all"
+                    } else {
+                        "↻  Rescan all"
+                    };
                     if ui
                         .add_enabled(
                             !self.monitor_running,
-                            egui::Button::new("↻  Scan all")
-                                .fill(color_accent())
-                                .stroke(egui::Stroke::NONE),
+                            egui::Button::new(
+                                egui::RichText::new(scan_all_label).color(color_on_accent()),
+                            )
+                            .fill(color_accent())
+                            .stroke(egui::Stroke::NONE),
                         )
                         .clicked()
                     {
@@ -3464,7 +3388,7 @@ impl BlockOpsApp {
                         [44.0, 32.0],
                         egui::TextEdit::singleline(&mut self.monitor_rack_input)
                             .char_limit(2)
-                            .hint_text("1-19"),
+                            .hint_text(format!("1-{}", self.rack_count)),
                     );
                     let scan_rack_clicked = ui
                         .add_enabled(!self.monitor_running, egui::Button::new("Scan rack"))
@@ -3504,11 +3428,14 @@ impl BlockOpsApp {
                         if ui
                             .add_enabled(
                                 !stopping,
-                                egui::Button::new(if stopping {
-                                    "Stopping..."
-                                } else {
-                                    "■  Stop live"
-                                })
+                                egui::Button::new(
+                                    egui::RichText::new(if stopping {
+                                        "Stopping..."
+                                    } else {
+                                        "■  Stop live"
+                                    })
+                                    .color(color_on_accent()),
+                                )
                                 .fill(color_danger())
                                 .stroke(egui::Stroke::NONE),
                             )
@@ -3519,56 +3446,54 @@ impl BlockOpsApp {
                     } else if ui
                         .add_enabled(
                             !self.monitor_running,
-                            egui::Button::new("▶  Start live")
-                                .fill(color_success())
-                                .stroke(egui::Stroke::NONE),
+                            egui::Button::new(
+                                egui::RichText::new("▶  Start live").color(color_on_accent()),
+                            )
+                            .fill(color_success())
+                            .stroke(egui::Stroke::NONE),
                         )
                         .clicked()
                     {
                         self.start_monitor_scan(true, None);
                     }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if mode_button(ui, "✎  Assign IP", self.edit_rack_map, color_warning())
-                            .clicked()
-                        {
-                            self.edit_rack_map = true;
-                        }
-                        if mode_button(ui, "⌖  Inspect", !self.edit_rack_map, color_accent())
-                            .clicked()
-                        {
-                            self.edit_rack_map = false;
-                            self.armed_target_ip = None;
-                        }
-                        toolbar_label(ui, "MODE");
-                    });
-                });
-
-                if self.edit_rack_map {
-                    ui.add_space(8.0);
+                    ui.separator();
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(49, 38, 20))
                         .stroke(egui::Stroke::new(
-                            1.0,
+                            1.0_f32,
                             color_warning().linear_multiply(0.55),
                         ))
                         .rounding(egui::Rounding::same(5.0))
                         .inner_margin(egui::Margin::symmetric(9.0, 6.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let listener_label = if self.listener_started {
+                                let listener_label = if self.listener_starting {
+                                    "Starting..."
+                                } else if self.listener_started {
                                     "■  Stop listener"
                                 } else {
                                     "▶  Start listener"
                                 };
                                 if ui
-                                    .add(egui::Button::new(listener_label).fill(
-                                        if self.listener_started {
-                                            color_success()
-                                        } else {
-                                            color_surface_high()
-                                        },
-                                    ))
+                                    .add_enabled(
+                                        !self.listener_starting,
+                                        egui::Button::new(
+                                            egui::RichText::new(listener_label).color(
+                                                if self.listener_started {
+                                                    color_on_accent()
+                                                } else {
+                                                    color_text()
+                                                },
+                                            ),
+                                        )
+                                        .fill(
+                                            if self.listener_started {
+                                                color_success()
+                                            } else {
+                                                color_surface_high()
+                                            },
+                                        ),
+                                    )
                                     .clicked()
                                 {
                                     self.toggle_listener();
@@ -3584,7 +3509,7 @@ impl BlockOpsApp {
                                 {
                                     ui.strong(
                                         egui::RichText::new(format!(
-                                            "ARMED TARGET   R{:02} / S{:03}   {}",
+                                            "ARMED TARGET   Rack {} / Slot {}   {}",
                                             rack, slot, target
                                         ))
                                         .color(color_warning()),
@@ -3595,15 +3520,15 @@ impl BlockOpsApp {
                                     }
                                 } else {
                                     ui.label(
-                                egui::RichText::new(
-                                    "Select a slot, then press IP Report on that physical miner.",
-                                )
-                                .color(color_warning()),
-                            );
+                                        egui::RichText::new("NO SLOT ARMED")
+                                            .size(10.5)
+                                            .strong()
+                                            .color(color_warning()),
+                                    );
                                 }
                             })
                         });
-                }
+                });
             });
     }
 
@@ -3625,27 +3550,41 @@ impl BlockOpsApp {
                     color_text_muted()
                 },
             );
-            ui.label(if self.listener_started {
+            ui.label(if self.listener_starting {
+                "IP Report listener starting"
+            } else if self.listener_started {
                 "IP Report listener active"
             } else {
                 "IP Report listener stopped"
             });
-            let listener_label = if self.listener_started {
+            let listener_label = if self.listener_starting {
+                "Starting..."
+            } else if self.listener_started {
                 "Stop"
             } else {
                 "Start"
             };
-            if ui.button(listener_label).clicked() {
+            if ui
+                .add_enabled(!self.listener_starting, egui::Button::new(listener_label))
+                .clicked()
+            {
                 self.toggle_listener();
             }
         });
         ui.horizontal(|ui| {
-            toolbar_label(ui, "FIRST TARGET");
-            let start_input = ui.add_sized(
-                [126.0, 32.0],
-                egui::TextEdit::singleline(&mut self.start_ip_input).hint_text("10.4.1.1"),
+            toolbar_label(ui, "START POINT");
+            let start_input = ui.add_enabled(
+                !self.monitor_running && !self.apply_running,
+                egui::TextEdit::singleline(&mut self.start_ip_input)
+                    .desired_width(126.0)
+                    .hint_text(DEFAULT_START_IP),
             );
-            let set_clicked = ui.button("Set").clicked();
+            let set_clicked = ui
+                .add_enabled(
+                    valid_ip(&self.start_ip_input) && !self.monitor_running && !self.apply_running,
+                    egui::Button::new("Set"),
+                )
+                .clicked();
             let set_entered =
                 start_input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if set_clicked || set_entered {
@@ -3702,7 +3641,7 @@ impl BlockOpsApp {
         if ui
             .add_enabled(
                 has_pending_changes && !self.apply_running,
-                egui::Button::new(apply_label)
+                egui::Button::new(egui::RichText::new(apply_label).color(color_on_accent()))
                     .fill(color_success())
                     .stroke(egui::Stroke::NONE)
                     .min_size(egui::vec2(170.0, 36.0)),
@@ -3741,7 +3680,7 @@ impl BlockOpsApp {
 
         egui::Frame::none()
             .fill(color_surface())
-            .stroke(egui::Stroke::new(1.0, color_border()))
+            .stroke(egui::Stroke::new(1.0_f32, color_border()))
             .rounding(egui::Rounding::same(7.0))
             .inner_margin(egui::Margin::same(12.0))
             .show(ui, |ui| {
@@ -3874,7 +3813,7 @@ impl BlockOpsApp {
     fn render_assignment_table(&mut self, ui: &mut egui::Ui, max_height: f32) {
         egui::Frame::none()
             .fill(color_surface())
-            .stroke(egui::Stroke::new(1.0, color_border()))
+            .stroke(egui::Stroke::new(1.0_f32, color_border()))
             .rounding(egui::Rounding::same(7.0))
             .inner_margin(egui::Margin::same(12.0))
             .show(ui, |ui| {
@@ -4018,7 +3957,7 @@ impl BlockOpsApp {
 
                 egui::Frame::none()
                     .fill(color_surface())
-                    .stroke(egui::Stroke::new(1.0, color_border()))
+                    .stroke(egui::Stroke::new(1.0_f32, color_border()))
                     .rounding(egui::Rounding::same(7.0))
                     .inner_margin(egui::Margin::symmetric(12.0, 9.0))
                     .show(ui, |ui| {
@@ -4026,12 +3965,15 @@ impl BlockOpsApp {
                             settings_summary(
                                 &mut columns[0],
                                 "ADDRESS SPACE",
-                                &format!("10.4.1-{}  /  {} slots", self.rack_count, self.rack_size),
+                                &format!(
+                                    "{}  /  {} racks  /  {} slots",
+                                    self.start_ip_input, self.rack_count, self.rack_size
+                                ),
                             );
                             settings_summary(
                                 &mut columns[1],
                                 "SCAN WORKERS",
-                                &self.parallel_jobs.to_string(),
+                                &self.scan_workers.to_string(),
                             );
                             settings_summary(
                                 &mut columns[2],
@@ -4042,7 +3984,7 @@ impl BlockOpsApp {
                     });
                 ui.add_space(10.0);
 
-                let section_stroke = egui::Stroke::new(1.0, color_border());
+                let section_stroke = egui::Stroke::new(1.0_f32, color_border());
                 ui.columns(2, |columns| {
                     egui::Frame::none()
                         .fill(color_surface())
@@ -4060,12 +4002,6 @@ impl BlockOpsApp {
                                 .num_columns(2)
                                 .spacing(egui::vec2(16.0, 8.0))
                                 .show(ui, |ui| {
-                                    ui.label("Rack 1, Slot 1 IP");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.rack_one_slot_one_ip)
-                                            .desired_width(150.0),
-                                    );
-                                    ui.end_row();
                                     ui.label("Rack count");
                                     ui.add(
                                         egui::DragValue::new(&mut self.rack_count)
@@ -4105,7 +4041,13 @@ impl BlockOpsApp {
                                             .suffix(" sec"),
                                     );
                                     ui.end_row();
-                                    ui.label("Parallel jobs");
+                                    ui.label("Scan workers");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.scan_workers)
+                                            .clamp_range(1..=128),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Apply workers");
                                     ui.add(
                                         egui::DragValue::new(&mut self.parallel_jobs)
                                             .clamp_range(1..=64),
@@ -4238,12 +4180,32 @@ impl App for BlockOpsApp {
             self.blockops_splash.show(ctx);
             if self.blockops_splash.is_done() {
                 self.splash_done = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                self.maximize_after_splash = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                    1050.0, 720.0,
+                )));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1220.0, 860.0)));
             }
             return;
         }
 
-        ctx.request_repaint_after(Duration::from_millis(200));
+        if self.maximize_after_splash {
+            self.maximize_after_splash = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+
+        let repaint_ms = if self.monitor_running
+            || self.apply_running
+            || self.listener_started
+            || self.listener_starting
+        {
+            120
+        } else {
+            500
+        };
+        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
         self.poll_channels();
 
         if let Some(popup) = self.wrong_subnet_popup.clone() {
@@ -4301,10 +4263,6 @@ impl App for BlockOpsApp {
                 });
         }
 
-        if self.active_view == AppView::RackDashboard {
-            self.render_miner_detail_popup(ctx);
-        }
-
         let fleet_counts =
             (self.active_view == AppView::RackDashboard).then(|| self.monitor_counts());
 
@@ -4314,7 +4272,10 @@ impl App for BlockOpsApp {
             .frame(
                 egui::Frame::none()
                     .fill(color_sidebar())
-                    .stroke(egui::Stroke::new(1.0, color_border()))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        egui::Color32::from_rgb(38, 48, 60),
+                    ))
                     .inner_margin(egui::Margin::same(14.0)),
             )
             .show(ctx, |ui| {
@@ -4326,18 +4287,18 @@ impl App for BlockOpsApp {
                                 egui::RichText::new("BlockOps")
                                     .size(17.0)
                                     .strong()
-                                    .color(color_text()),
+                                    .color(color_sidebar_text()),
                             );
                             ui.label(
                                 egui::RichText::new("STATIC IP MANAGER")
                                     .size(10.0)
                                     .strong()
-                                    .color(color_text_muted()),
+                                    .color(color_sidebar_muted()),
                             );
                         });
                     });
                     ui.add_space(22.0);
-                    section_label(ui, "WORKSPACE");
+                    sidebar_section_label(ui, "WORKSPACE");
                     ui.add_space(6.0);
 
                     for (view, icon, label) in [
@@ -4353,35 +4314,45 @@ impl App for BlockOpsApp {
 
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                         ui.label(
-                            egui::RichText::new("VERSION 2.1.1")
+                            egui::RichText::new(format!("VERSION {}", APP_VERSION))
                                 .size(10.0)
-                                .color(color_text_muted()),
+                                .color(color_sidebar_muted()),
                         );
                         ui.add_space(8.0);
                         egui::Frame::none()
-                            .fill(color_surface())
-                            .stroke(egui::Stroke::new(1.0, color_border()))
+                            .fill(color_sidebar_surface())
+                            .stroke(egui::Stroke::new(
+                                1.0_f32,
+                                egui::Color32::from_rgb(43, 54, 67),
+                            ))
                             .rounding(egui::Rounding::same(7.0))
                             .inner_margin(egui::Margin::same(10.0))
                             .show(ui, |ui| {
                                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                                     ui.set_min_width(ui.available_width());
-                                    section_label(ui, "SITE STATUS");
+                                    sidebar_section_label(ui, "SITE STATUS");
                                     ui.add_space(6.0);
                                     ui.horizontal(|ui| {
                                         status_dot(
                                             ui,
                                             if self.listener_started {
                                                 color_success()
+                                            } else if self.listener_starting {
+                                                color_warning()
                                             } else {
-                                                color_text_muted()
+                                                color_sidebar_muted()
                                             },
                                         );
-                                        ui.label(if self.listener_started {
-                                            "IP Report listening"
-                                        } else {
-                                            "IP Report stopped"
-                                        });
+                                        ui.label(
+                                            egui::RichText::new(if self.listener_starting {
+                                                "IP Report starting"
+                                            } else if self.listener_started {
+                                                "IP Report listening"
+                                            } else {
+                                                "IP Report stopped"
+                                            })
+                                            .color(color_sidebar_text()),
+                                        );
                                     });
                                     ui.add_space(5.0);
                                     sidebar_stat(
@@ -4397,11 +4368,11 @@ impl App for BlockOpsApp {
                                     ui.add_space(5.0);
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "10.4.1-{}  /  {} slots per rack",
-                                            self.rack_count, self.rack_size
+                                            "{}  /  {} racks  /  {} slots each",
+                                            self.start_ip_input, self.rack_count, self.rack_size
                                         ))
                                         .size(10.5)
-                                        .color(color_text_muted()),
+                                        .color(color_sidebar_muted()),
                                     );
                                 });
                             });
@@ -4413,8 +4384,8 @@ impl App for BlockOpsApp {
             .exact_height(64.0)
             .frame(
                 egui::Frame::none()
-                    .fill(color_sidebar())
-                    .stroke(egui::Stroke::new(1.0, color_border()))
+                    .fill(color_surface())
+                    .stroke(egui::Stroke::new(1.0_f32, color_border()))
                     .inner_margin(egui::Margin::symmetric(16.0, 9.0)),
             )
             .show(ctx, |ui| {
@@ -4455,7 +4426,11 @@ impl App for BlockOpsApp {
                     );
 
                     if let Some(counts) = fleet_counts.as_ref() {
-                        let status_reserve = if self.listener_started { 220.0 } else { 132.0 };
+                        let status_reserve = if self.listener_started || self.listener_starting {
+                            220.0
+                        } else {
+                            132.0
+                        };
                         let metrics_width = (ui.available_width() - status_reserve).max(0.0);
                         if metrics_width >= 540.0 {
                             let other_online = counts.auth + counts.web + counts.ssh;
@@ -4519,6 +4494,8 @@ impl App for BlockOpsApp {
                         status_badge(ui, activity, activity_color);
                         if self.listener_started {
                             status_badge(ui, "IP REPORT", color_accent());
+                        } else if self.listener_starting {
+                            status_badge(ui, "IP REPORT STARTING", color_warning());
                         }
                     });
                 });
@@ -4528,15 +4505,18 @@ impl App for BlockOpsApp {
             .exact_height(32.0)
             .frame(
                 egui::Frame::none()
-                    .fill(color_sidebar())
-                    .stroke(egui::Stroke::new(1.0, color_border()))
+                    .fill(color_surface())
+                    .stroke(egui::Stroke::new(1.0_f32, color_border()))
                     .inner_margin(egui::Margin::symmetric(12.0, 6.0)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let activity_color = if self.apply_running {
                         color_warning()
-                    } else if self.monitor_running || self.listener_started {
+                    } else if self.monitor_running
+                        || self.listener_started
+                        || self.listener_starting
+                    {
                         color_success()
                     } else {
                         color_text_muted()
@@ -4547,6 +4527,24 @@ impl App for BlockOpsApp {
                             .small()
                             .color(color_text_muted()),
                     );
+                    if self.monitor_running && self.monitor_total > 0 {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} / {}",
+                                    self.monitor_completed, self.monitor_total
+                                ))
+                                .small()
+                                .color(color_text_muted()),
+                            );
+                            ui.add(
+                                egui::ProgressBar::new(
+                                    self.monitor_completed as f32 / self.monitor_total as f32,
+                                )
+                                .desired_width(150.0),
+                            );
+                        });
+                    }
                 });
             });
 
@@ -4561,6 +4559,7 @@ impl App for BlockOpsApp {
                 AppView::IpAssignment => self.render_ip_assignment(ui),
                 AppView::Settings => self.render_settings(ui),
             });
+        self.persist_preferences_if_changed();
     }
 }
 
@@ -4592,37 +4591,21 @@ fn slot_cell(
     response
 }
 
-fn detail_metric(ui: &mut egui::Ui, label: &str, value: &str) {
-    egui::Frame::none()
-        .fill(color_surface_high())
-        .stroke(egui::Stroke::new(1.0, color_border()))
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::symmetric(9.0, 7.0))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(label)
-                        .size(10.0)
-                        .strong()
-                        .color(color_text_muted()),
-                );
-                ui.label(
-                    egui::RichText::new(value)
-                        .size(15.0)
-                        .strong()
-                        .color(color_text()),
-                );
-            });
-        });
-}
-
 fn section_label(ui: &mut egui::Ui, label: &str) {
     ui.label(
         egui::RichText::new(label)
             .size(10.5)
             .strong()
             .color(color_text_muted()),
+    );
+}
+
+fn sidebar_section_label(ui: &mut egui::Ui, label: &str) {
+    ui.label(
+        egui::RichText::new(label)
+            .size(10.5)
+            .strong()
+            .color(color_sidebar_muted()),
     );
 }
 
@@ -4647,7 +4630,7 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
 fn status_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     egui::Frame::none()
         .fill(soft_tint(color, 32))
-        .stroke(egui::Stroke::new(1.0, soft_tint(color, 105)))
+        .stroke(egui::Stroke::new(1.0_f32, soft_tint(color, 105)))
         .rounding(egui::Rounding::same(5.0))
         .inner_margin(egui::Margin::symmetric(8.0, 4.0))
         .show(ui, |ui| {
@@ -4658,60 +4641,53 @@ fn status_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
         });
 }
 
-fn mode_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    selected: bool,
-    color: egui::Color32,
-) -> egui::Response {
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).color(if selected {
-            color
-        } else {
-            color_text_muted()
-        }))
-        .fill(if selected {
-            soft_tint(color, 30)
-        } else {
-            color_surface_high()
-        })
-        .stroke(egui::Stroke::new(
-            1.0,
-            if selected { color } else { color_border() },
-        )),
-    )
-}
-
 fn nav_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool) -> egui::Response {
-    let response = ui.add_sized(
-        [ui.available_width(), 42.0],
-        egui::Button::new(
-            egui::RichText::new(format!("{}   {}", icon, label))
-                .size(13.0)
-                .color(if selected {
-                    color_text()
-                } else {
-                    color_text_muted()
-                }),
-        )
-        .fill(if selected {
-            color_accent_soft()
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+    let fill = if selected {
+        color_sidebar_selected()
+    } else if response.hovered() {
+        color_sidebar_surface()
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let stroke = if selected {
+        egui::Stroke::new(1.0_f32, soft_tint(color_accent(), 120))
+    } else {
+        egui::Stroke::NONE
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(6.0), fill);
+    ui.painter()
+        .rect_stroke(rect, egui::Rounding::same(6.0), stroke);
+
+    let content_color = if selected || response.hovered() {
+        color_sidebar_text()
+    } else {
+        color_sidebar_muted()
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + 18.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        icon,
+        egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        if selected {
+            color_accent()
         } else {
-            color_sidebar()
-        })
-        .stroke(egui::Stroke::new(
-            1.0,
-            if selected {
-                soft_tint(color_accent(), 115)
-            } else {
-                egui::Color32::TRANSPARENT
-            },
-        )),
+            content_color
+        },
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 48.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        content_color,
     );
     if selected {
         let marker = egui::Rect::from_min_max(
-            response.rect.left_top() + egui::vec2(1.0, 7.0),
-            response.rect.left_bottom() + egui::vec2(4.0, -7.0),
+            rect.left_top() + egui::vec2(1.0, 8.0),
+            rect.left_bottom() + egui::vec2(4.0, -8.0),
         );
         ui.painter()
             .rect_filled(marker, egui::Rounding::same(1.5), color_accent());
@@ -4721,15 +4697,12 @@ fn nav_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool) -> egu
 
 fn brand_mark(ui: &mut egui::Ui, size: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    ui.painter().rect_filled(
-        rect,
-        egui::Rounding::same(8.0),
-        egui::Color32::from_rgb(18, 45, 72),
-    );
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(8.0), color_sidebar_selected());
     ui.painter().rect_stroke(
         rect,
         egui::Rounding::same(8.0),
-        egui::Stroke::new(1.0, soft_tint(color_accent(), 135)),
+        egui::Stroke::new(1.0_f32, soft_tint(color_accent(), 135)),
     );
 
     let link_height = size * 0.24;
@@ -4743,7 +4716,7 @@ fn brand_mark(ui: &mut egui::Ui, size: f32) {
         center + egui::vec2(size * 0.13, 0.0),
         egui::vec2(link_width, link_height),
     );
-    let stroke = egui::Stroke::new(2.2, color_text());
+    let stroke = egui::Stroke::new(2.2_f32, color_sidebar_text());
     ui.painter()
         .rect_stroke(left, egui::Rounding::same(3.0), stroke);
     ui.painter()
@@ -4753,56 +4726,58 @@ fn brand_mark(ui: &mut egui::Ui, size: f32) {
             center - egui::vec2(size * 0.09, 0.0),
             center + egui::vec2(size * 0.09, 0.0),
         ],
-        egui::Stroke::new(2.6, color_text()),
+        egui::Stroke::new(2.6_f32, color_sidebar_text()),
     );
 }
 
 fn sidebar_stat(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).small().color(color_text_muted()));
+        ui.label(
+            egui::RichText::new(label)
+                .small()
+                .color(color_sidebar_muted()),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(value)
                     .small()
                     .strong()
-                    .color(color_text()),
+                    .color(color_sidebar_text()),
             );
         });
     });
 }
 
 fn header_metric(ui: &mut egui::Ui, label: &str, count: usize, color: egui::Color32) {
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            status_dot(ui, color);
-            ui.label(
-                egui::RichText::new(label)
-                    .size(10.0)
-                    .strong()
-                    .color(color_text_muted()),
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(count.to_string())
-                    .size(15.0)
-                    .strong()
-                    .color(color_text()),
-            );
-        });
-    });
-}
-
-fn monitor_state_color(state: SlotMonitorState) -> egui::Color32 {
-    match state {
-        SlotMonitorState::VnishMiner => color_accent(),
-        SlotMonitorState::BitmainMiner => egui::Color32::from_rgb(43, 177, 157),
-        SlotMonitorState::AuthRequired => egui::Color32::from_rgb(150, 112, 219),
-        SlotMonitorState::WebOnline => egui::Color32::from_rgb(93, 160, 181),
-        SlotMonitorState::SshOnly => egui::Color32::from_rgb(126, 137, 153),
-        SlotMonitorState::Offline => color_danger(),
-        SlotMonitorState::Unknown => color_text_muted(),
-    }
+    let width = ui.available_width().max(68.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 44.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(5.0), soft_tint(color, 18));
+    ui.painter().rect_stroke(
+        rect,
+        egui::Rounding::same(5.0),
+        egui::Stroke::new(1.0_f32, soft_tint(color, 55)),
+    );
+    let rail = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(1.0, 6.0),
+        rect.left_bottom() + egui::vec2(4.0, -6.0),
+    );
+    ui.painter()
+        .rect_filled(rail, egui::Rounding::same(1.5), color);
+    ui.painter().text(
+        rect.left_top() + egui::vec2(11.0, 9.0),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::new(9.5, egui::FontFamily::Proportional),
+        color_text_muted(),
+    );
+    ui.painter().text(
+        rect.left_bottom() + egui::vec2(11.0, -7.0),
+        egui::Align2::LEFT_BOTTOM,
+        count.to_string(),
+        egui::FontId::new(16.0, egui::FontFamily::Proportional),
+        color,
+    );
 }
 
 fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -4853,21 +4828,24 @@ fn table_status(ui: &mut egui::Ui, status: &str) {
 fn empty_assignment_state(ui: &mut egui::Ui, listener_started: bool) {
     ui.vertical_centered(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
-        ui.painter()
-            .circle_stroke(rect.center(), 20.0, egui::Stroke::new(1.0, color_border()));
+        ui.painter().circle_stroke(
+            rect.center(),
+            20.0,
+            egui::Stroke::new(1.0_f32, color_border()),
+        );
         ui.painter().line_segment(
             [
                 rect.center() + egui::vec2(-9.0, -5.0),
                 rect.center() + egui::vec2(9.0, -5.0),
             ],
-            egui::Stroke::new(1.8, color_text_muted()),
+            egui::Stroke::new(1.8_f32, color_text_muted()),
         );
         ui.painter().line_segment(
             [
                 rect.center() + egui::vec2(-9.0, 5.0),
                 rect.center() + egui::vec2(9.0, 5.0),
             ],
-            egui::Stroke::new(1.8, color_text_muted()),
+            egui::Stroke::new(1.8_f32, color_text_muted()),
         );
         ui.add_space(8.0);
         ui.label(
@@ -4933,8 +4911,10 @@ fn main() -> eframe::Result<()> {
     center_window_after_startup();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1220.0, 860.0])
-            .with_min_inner_size([1050.0, 720.0])
+            .with_inner_size([960.0, 540.0])
+            .with_min_inner_size([960.0, 540.0])
+            .with_resizable(false)
+            .with_decorations(false)
             .with_title("BlockOps Static IP Manager")
             .with_icon(load_app_icon()),
         ..Default::default()
@@ -4962,18 +4942,98 @@ mod tests {
 
     #[test]
     fn validates_only_ipv4_addresses() {
-        assert!(valid_ip("10.4.19.168"));
-        assert!(!valid_ip("10.4.19.999"));
+        assert!(valid_ip("10.3.19.168"));
+        assert!(!valid_ip("10.3.19.999"));
         assert!(!valid_ip("2001:db8::1"));
     }
 
     #[test]
     fn next_address_stays_inside_assignable_host_range() {
         assert_eq!(
-            next_ipv4(Ipv4Addr::new(10, 4, 1, 167)),
-            Some(Ipv4Addr::new(10, 4, 1, 168))
+            next_ipv4(Ipv4Addr::new(10, 3, 1, 167)),
+            Some(Ipv4Addr::new(10, 3, 1, 168))
         );
-        assert_eq!(next_ipv4(Ipv4Addr::new(10, 4, 1, 254)), None);
+        assert_eq!(next_ipv4(Ipv4Addr::new(10, 3, 1, 254)), None);
+    }
+
+    #[test]
+    fn rack_map_uses_the_shared_start_point() {
+        let start = Ipv4Addr::new(10, 3, 1, 1);
+        assert_eq!(
+            rack_slot_ip(start, 1, 1, 168),
+            Some(Ipv4Addr::new(10, 3, 1, 1))
+        );
+        assert_eq!(
+            rack_slot_ip(start, 36, 168, 168),
+            Some(Ipv4Addr::new(10, 3, 36, 168))
+        );
+
+        let shifted = Ipv4Addr::new(10, 5, 4, 20);
+        assert_eq!(
+            rack_slot_ip(shifted, 2, 3, 168),
+            Some(Ipv4Addr::new(10, 5, 5, 22))
+        );
+        assert_eq!(rack_slot_ip(shifted, 1, 0, 168), None);
+    }
+
+    #[test]
+    fn settings_upgrade_previous_rack_layout_and_preserve_custom_counts() {
+        for (value, expected) in [
+            (json!({"version": 1, "rack_count": 19}), 36),
+            (json!({"rack_count": 19}), 36),
+            (json!({"version": 1, "rack_count": 28}), 28),
+            (json!({"version": 2, "rack_count": 19}), 19),
+            (json!({"version": 2, "rack_count": 36}), 36),
+            (json!({"version": 1}), 36),
+        ] {
+            assert_eq!(
+                SitePreferences::from_value(&value).rack_count,
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn lightweight_scan_preserves_known_vendor_on_generic_web_response() {
+        assert_eq!(
+            merge_monitor_state(
+                Some(SlotMonitorState::VnishMiner),
+                SlotMonitorState::WebOnline
+            ),
+            SlotMonitorState::VnishMiner
+        );
+        assert_eq!(
+            merge_monitor_state(
+                Some(SlotMonitorState::BitmainMiner),
+                SlotMonitorState::Offline
+            ),
+            SlotMonitorState::Offline
+        );
+    }
+
+    #[test]
+    fn session_files_are_built_below_the_user_data_root() {
+        let path = session_file_path(
+            Path::new(r"C:\Users\operator\AppData\Local\BlockOps"),
+            "blockops_apply_results",
+            "csv",
+            "20261023_153000",
+        );
+        assert_eq!(
+            path,
+            PathBuf::from(
+                r"C:\Users\operator\AppData\Local\BlockOps\blockops_apply_results_20261023_153000.csv"
+            )
+        );
+    }
+
+    #[test]
+    fn recognizes_common_vnish_status_payloads() {
+        assert!(body_looks_like_vnish_miner(
+            r#"{"miner":{"hashrate":105.5},"firmware":"VNISH"}"#
+        ));
+        assert!(!body_looks_like_vnish_miner("not found"));
     }
 
     #[test]
@@ -4983,6 +5043,43 @@ mod tests {
             parking_ip_for_target("10.4.7.42", &used),
             Some("10.4.7.170".to_string())
         );
+    }
+
+    #[test]
+    fn safe_plan_skips_miners_already_on_their_target_ip() {
+        let mut app = BlockOpsApp {
+            rows: vec![
+                MinerRow {
+                    line: 1,
+                    current_ip: "10.3.1.1".to_string(),
+                    target_ip: "10.3.1.1".to_string(),
+                    mac: "00:11:22:33:44:55".to_string(),
+                    status: String::new(),
+                    apply_order: String::new(),
+                    apply_wave: String::new(),
+                    apply_type: String::new(),
+                    apply_status: String::new(),
+                },
+                MinerRow {
+                    line: 2,
+                    current_ip: "10.4.1.3".to_string(),
+                    target_ip: "10.4.1.2".to_string(),
+                    mac: "00:11:22:33:44:66".to_string(),
+                    status: String::new(),
+                    apply_order: String::new(),
+                    apply_wave: String::new(),
+                    apply_type: String::new(),
+                    apply_status: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        app.build_safe_order();
+
+        assert!(app.apply_steps.iter().all(|step| step.row_line != 1));
+        assert_eq!(app.rows[0].apply_status, "Already correct; skipped");
+        assert!(app.apply_steps.iter().any(|step| step.row_line == 2));
     }
 
     #[test]
@@ -5003,5 +5100,17 @@ mod tests {
         let report = parse_report_packet(b"ip=10.4.3.77 mac=AA-BB-CC-DD-EE-FF", "10.4.3.12");
         assert_eq!(report.current_ip, "10.4.3.77");
         assert_eq!(report.mac, "aa:bb:cc:dd:ee:ff");
+        assert!(!report.relayed);
+    }
+
+    #[test]
+    fn parses_vpn_relay_envelope_with_original_sender() {
+        let report = parse_report_packet(
+            b"BLOCKOPS_RELAY_V1\n10.4.7.42\nmac=AA-BB-CC-DD-EE-FF",
+            "100.64.0.8",
+        );
+        assert_eq!(report.current_ip, "10.4.7.42");
+        assert_eq!(report.mac, "aa:bb:cc:dd:ee:ff");
+        assert!(report.relayed);
     }
 }

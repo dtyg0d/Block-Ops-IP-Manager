@@ -26,11 +26,11 @@ The first version uses a simple rule:
 
 Example:
 
-- Rack 1 Slot 1 IP: `10.4.1.1`
-- Rack count: `19`
+- Rack 1 Slot 1 IP: `10.3.1.1`
+- Rack count: `36`
 - Rack size: `168`
 
-This maps Rack 1 to `10.4.1.1-168`, Rack 2 to `10.4.2.1-168`, and continues through Rack 19 at `10.4.19.1-168`.
+This maps Rack 1 to `10.3.1.1-168`, Rack 2 to `10.3.2.1-168`, and continues through Rack 36 at `10.3.36.1-168`.
 
 ## Resilient monitoring
 
@@ -38,7 +38,7 @@ This maps Rack 1 to `10.4.1.1-168`, Rack 2 to `10.4.2.1-168`, and continues thro
 - A previously online miner must fail two checks in a row before the dashboard marks it offline.
 - Individual connection failures do not stop the rest of the scan or the live monitor.
 - `Stop Live` cancels between network probes and ignores results that arrive after cancellation.
-- `Rescan All` starts a fresh scan across all 19 racks.
+- `Rescan All` starts a fresh scan across all 36 racks.
 - Apply batches cannot overlap; IP Reports received during an apply are queued for the next batch.
 - Successful apply steps immediately update the miner's current IP and final status.
 - Known VNISH and Bitmain miners use their matching setter directly instead of waiting through the wrong firmware method.
