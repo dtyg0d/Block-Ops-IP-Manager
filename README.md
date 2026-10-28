@@ -38,6 +38,11 @@ not affect the rack map. Build or pre-check
 the safe plan, review every row, then apply. A later report received while an
 apply is active is queued instead of starting a competing write batch.
 
+**Clear assignments** empties the working queue, clears skipped targets and redo
+state, and resets the cursor to the assignment start point. The listener and live
+monitor stay running. Previous autosaved CSV results are retained. Clearing is
+disabled while settings are being applied to miners.
+
 ## Faster monitoring
 
 The monitor uses a bounded worker pool, short TCP reachability checks, and at

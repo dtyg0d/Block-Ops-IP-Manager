@@ -368,16 +368,32 @@ impl SlotMonitorState {
 
 #[derive(Debug)]
 enum BackgroundEvent {
-    Status(String),
     ListenerReady(u16),
     ListenerStopped,
     ListenerFailed(String),
-    PrecheckResult { row_line: usize, result: String },
-    ApplyStepStatus { order: usize, status: String },
+    PrecheckResult {
+        generation: u64,
+        row_line: usize,
+        result: String,
+    },
+    PrecheckFinished {
+        generation: u64,
+    },
+    ApplyStepStatus {
+        order: usize,
+        status: String,
+    },
     ApplySequenceDone,
-    MonitorCycleStarted { total: usize },
-    MonitorResult { ip: String, state: SlotMonitorState },
-    MonitorCycleDone { elapsed_ms: u128 },
+    MonitorCycleStarted {
+        total: usize,
+    },
+    MonitorResult {
+        ip: String,
+        state: SlotMonitorState,
+    },
+    MonitorCycleDone {
+        elapsed_ms: u128,
+    },
     MonitorDone,
 }
 
@@ -1516,6 +1532,7 @@ struct BlockOpsApp {
     rows: Vec<MinerRow>,
     skips: Vec<SkipRow>,
     apply_steps: Vec<ApplyStep>,
+    precheck_generation: u64,
 
     assigned_current_ips: HashSet<String>,
     assigned_macs: HashSet<String>,
@@ -1598,6 +1615,7 @@ impl Default for BlockOpsApp {
             rows: Vec::new(),
             skips: Vec::new(),
             apply_steps: Vec::new(),
+            precheck_generation: 0,
 
             assigned_current_ips: HashSet::new(),
             assigned_macs: HashSet::new(),
@@ -2253,6 +2271,55 @@ impl BlockOpsApp {
             "Redo cancelled. Next IP Report will use the normal next target IP.".to_string();
     }
 
+    fn clear_assignments(&mut self) {
+        if self.apply_running {
+            self.status =
+                "Wait for the active apply batch before clearing assignments.".to_string();
+            return;
+        }
+
+        let cleared_count = self.rows.len();
+        self.rows.clear();
+        self.skips.clear();
+        self.apply_steps.clear();
+        self.precheck_generation = self.precheck_generation.wrapping_add(1);
+        self.rebuild_assignment_sets();
+        self.next_target_ip = parse_ipv4(&self.start_ip_input);
+        self.selected_line = None;
+        self.redo_target_ip = None;
+        self.redo_row_line = None;
+        self.selected_rack_slot = None;
+        self.armed_target_ip = None;
+        self.wrong_subnet_popup = None;
+        self.apply_queued = false;
+        self.scroll_to_bottom_next = false;
+
+        // Discard packets already waiting for the cleared queue. The listener
+        // remains open for the next physical IP Report button press.
+        while self.report_rx.try_recv().is_ok() {}
+
+        // Keep the previous batch's autosaved results when the new queue applies.
+        if let Some(parent) = Path::new(&self.apply_results_path).parent() {
+            self.apply_results_path = session_file_path(
+                parent,
+                "blockops_apply_results",
+                "csv",
+                &Local::now().format("%Y%m%d_%H%M%S_%f").to_string(),
+            )
+            .to_string_lossy()
+            .into_owned();
+        }
+
+        self.status = format!(
+            "Cleared {} assignment rows. Next target IP: {}.",
+            cleared_count,
+            self.next_target_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "not set; enter a valid start point".to_string())
+        );
+        self.log(&self.status);
+    }
+
     fn should_rewind_next_ip_to(&self, ip: &str) -> bool {
         match (parse_ipv4(ip), self.next_target_ip) {
             (Some(removed_ip), Some(next_ip)) => next_ipv4(removed_ip) == Some(next_ip),
@@ -2395,6 +2462,7 @@ impl BlockOpsApp {
         let timeout = self.timeout_secs.max(5);
         let parallel_jobs = self.parallel_jobs.max(1);
         let tx = self.status_tx.clone();
+        let generation = self.precheck_generation;
 
         self.status = format!(
             "Starting pre-check for {} planned apply steps...",
@@ -2422,6 +2490,7 @@ impl BlockOpsApp {
                         );
 
                         let _ = tx_step.send(BackgroundEvent::PrecheckResult {
+                            generation,
                             row_line: step.row_line,
                             result,
                         });
@@ -2433,14 +2502,12 @@ impl BlockOpsApp {
                 }
             }
 
-            let _ = tx.send(BackgroundEvent::Status(
-                "Pre-check finished. Review Apply column before running Apply Safe Order."
-                    .to_string(),
-            ));
+            let _ = tx.send(BackgroundEvent::PrecheckFinished { generation });
         });
     }
 
     fn build_safe_order(&mut self) {
+        self.precheck_generation = self.precheck_generation.wrapping_add(1);
         self.apply_steps.clear();
 
         // Rows that are already on the correct IP are kept in the occupancy map
@@ -2945,7 +3012,6 @@ impl BlockOpsApp {
 
         while let Ok(event) = self.status_rx.try_recv() {
             match event {
-                BackgroundEvent::Status(message) => self.status = message,
                 BackgroundEvent::ListenerReady(port) => {
                     self.listener_starting = false;
                     self.listener_started = true;
@@ -2963,7 +3029,14 @@ impl BlockOpsApp {
                     self.listener_stop = None;
                     self.status = error;
                 }
-                BackgroundEvent::PrecheckResult { row_line, result } => {
+                BackgroundEvent::PrecheckResult {
+                    generation,
+                    row_line,
+                    result,
+                } => {
+                    if generation != self.precheck_generation {
+                        continue;
+                    }
                     if let Some(step) = self
                         .apply_steps
                         .iter_mut()
@@ -2973,6 +3046,12 @@ impl BlockOpsApp {
                     }
                     self.log(&format!("Pre-check row {}: {}", row_line, result));
                     self.sync_apply_steps_to_rows();
+                }
+                BackgroundEvent::PrecheckFinished { generation } => {
+                    if generation == self.precheck_generation {
+                        self.status = "Pre-check finished. Review Apply column before running Apply Safe Order."
+                            .to_string();
+                    }
                 }
                 BackgroundEvent::ApplyStepStatus { order, status } => {
                     let mut successful_move = None;
@@ -3837,6 +3916,18 @@ impl BlockOpsApp {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.apply_running,
+                                egui::Button::new("↺  Clear assignments"),
+                            )
+                            .on_hover_text(
+                                "Clear the queue and restart from the assignment start point",
+                            )
+                            .clicked()
+                        {
+                            self.clear_assignments();
+                        }
                         ui.checkbox(&mut self.auto_scroll_miners, "Follow newest");
                     });
                 });
@@ -5061,6 +5152,152 @@ mod tests {
             "10.5.4"
         );
         assert_eq!(app.next_target_ip, Some(Ipv4Addr::new(10, 5, 4, 21)));
+    }
+
+    #[test]
+    fn clearing_assignments_restarts_capture_and_retains_monitoring() {
+        let mut app = report_test_app();
+        app.active_view = AppView::IpAssignment;
+        app.start_ip_input = "10.3.8.20".to_string();
+        app.set_start_ip();
+        app.add_miner("10.3.8.100".to_string(), "02:00:00:00:00:01".to_string());
+        app.skip_next_target();
+        app.skips.push(SkipRow {
+            line: 3,
+            skipped_ip: "10.3.8.22".to_string(),
+            reason: "Synthetic skip".to_string(),
+        });
+        app.build_safe_order();
+        app.select_assignment_row(1);
+        app.arm_selected_row_for_redo();
+        app.arm_rack_slot(8, 30);
+        app.monitor_running = true;
+        app.monitor_live = true;
+        app.monitor_results
+            .insert("10.3.8.40".to_string(), SlotMonitorState::VnishMiner);
+        app.apply_queued = true;
+        app.report_tx
+            .send(ReportPacket {
+                current_ip: "10.3.8.101".to_string(),
+                mac: "02:00:00:00:00:02".to_string(),
+                relayed: false,
+            })
+            .unwrap();
+        let previous_results_path = app.apply_results_path.clone();
+
+        app.clear_assignments();
+        app.poll_channels();
+
+        assert!(app.rows.is_empty());
+        assert!(app.skips.is_empty());
+        assert!(app.apply_steps.is_empty());
+        assert!(app.assigned_current_ips.is_empty());
+        assert!(app.assigned_macs.is_empty());
+        assert!(app.assigned_target_ips.is_empty());
+        assert_eq!(app.next_target_ip, Some(Ipv4Addr::new(10, 3, 8, 20)));
+        assert!(app.selected_line.is_none());
+        assert!(app.redo_target_ip.is_none());
+        assert!(app.redo_row_line.is_none());
+        assert!(app.selected_rack_slot.is_none());
+        assert!(app.armed_target_ip.is_none());
+        assert!(!app.apply_queued);
+        assert!(app.listener_started);
+        assert!(app.monitor_running && app.monitor_live);
+        assert_eq!(
+            app.monitor_results.get("10.3.8.40"),
+            Some(&SlotMonitorState::VnishMiner)
+        );
+        assert_ne!(app.apply_results_path, previous_results_path);
+        assert_eq!(
+            Path::new(&app.apply_results_path).parent(),
+            Path::new(&previous_results_path).parent()
+        );
+
+        app.add_miner("10.3.8.100".to_string(), "02:00:00:00:00:01".to_string());
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].line, 1);
+        assert_eq!(app.rows[0].target_ip, "10.3.8.20");
+        assert_eq!(app.next_target_ip, Some(Ipv4Addr::new(10, 3, 8, 21)));
+    }
+
+    #[test]
+    fn clearing_assignments_is_blocked_during_apply() {
+        let mut app = report_test_app();
+        app.active_view = AppView::IpAssignment;
+        app.add_miner("10.3.1.100".to_string(), "02:00:00:00:00:01".to_string());
+        app.build_safe_order();
+        app.apply_running = true;
+        app.apply_queued = true;
+        let generation = app.precheck_generation;
+        let next_target = app.next_target_ip;
+        let results_path = app.apply_results_path.clone();
+
+        app.clear_assignments();
+
+        assert_eq!(app.rows.len(), 1);
+        assert!(!app.apply_steps.is_empty());
+        assert!(app.assigned_current_ips.contains("10.3.1.100"));
+        assert!(app.assigned_target_ips.contains("10.3.1.1"));
+        assert_eq!(app.next_target_ip, next_target);
+        assert_eq!(app.precheck_generation, generation);
+        assert_eq!(app.apply_results_path, results_path);
+        assert!(app.apply_running && app.apply_queued);
+    }
+
+    #[test]
+    fn cleared_queue_ignores_old_precheck_results_for_reused_row_numbers() {
+        let mut app = report_test_app();
+        app.active_view = AppView::IpAssignment;
+        app.add_miner("10.3.1.100".to_string(), "02:00:00:00:00:01".to_string());
+        app.build_safe_order();
+        let old_generation = app.precheck_generation;
+
+        app.clear_assignments();
+        app.add_miner("10.3.1.101".to_string(), "02:00:00:00:00:02".to_string());
+        app.build_safe_order();
+        let pending_status = app.apply_steps[0].status.clone();
+        let current_status = app.status.clone();
+        app.status_tx
+            .send(BackgroundEvent::PrecheckResult {
+                generation: old_generation,
+                row_line: 1,
+                result: "Obsolete synthetic pre-check".to_string(),
+            })
+            .unwrap();
+        app.status_tx
+            .send(BackgroundEvent::PrecheckFinished {
+                generation: old_generation,
+            })
+            .unwrap();
+        app.poll_channels();
+
+        assert_eq!(app.apply_steps[0].status, pending_status);
+        assert_eq!(app.status, current_status);
+
+        app.status_tx
+            .send(BackgroundEvent::PrecheckResult {
+                generation: app.precheck_generation,
+                row_line: 1,
+                result: "Current synthetic pre-check".to_string(),
+            })
+            .unwrap();
+        app.poll_channels();
+        assert_eq!(app.apply_steps[0].status, "Current synthetic pre-check");
+        assert_eq!(app.rows[0].apply_status, "Current synthetic pre-check");
+    }
+
+    #[test]
+    fn clearing_with_an_invalid_start_point_leaves_the_cursor_unset() {
+        let mut app = report_test_app();
+        app.active_view = AppView::IpAssignment;
+        app.add_miner("10.3.1.100".to_string(), "02:00:00:00:00:01".to_string());
+        app.start_ip_input = "invalid".to_string();
+
+        app.clear_assignments();
+
+        assert!(app.rows.is_empty());
+        assert!(app.next_target_ip.is_none());
+        assert_eq!(app.rack_slot_target_ip(1, 1).as_deref(), Some("10.3.1.1"));
     }
 
     #[test]

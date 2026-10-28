@@ -9,6 +9,8 @@ manager.
 - Previous 19-rack settings upgrade to 36 racks; other custom counts are retained.
 - The rack map always starts at `10.3.1.1`; sequential assignment has its own start point.
 - The duplicate `Rack 1, Slot 1 IP` setting was removed.
+- Clear assignments starts a fresh queue without restarting the app or losing
+  previous autosaved results. It is disabled during an active apply batch.
 - Direct scans over routed VPN connections do not require a relay.
 - Monitoring uses a fixed worker pool instead of creating one operating-system
   thread per target.

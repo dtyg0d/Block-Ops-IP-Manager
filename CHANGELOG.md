@@ -7,6 +7,9 @@
 - Kept armed rack targets intact when changing the assignment start point.
 - Ignored unarmed rack-dashboard reports so repeat packets cannot fall into the
   sequential assignment workflow and trigger a false `10.3.1.x` subnet error.
+- Added Clear assignments to reset the queue, skips, redo state, and cursor while
+  retaining previous results and active monitoring/listening.
+- Ignored late pre-check results from cleared or rebuilt assignment plans.
 
 ## v3.0.0 - Operator workflow rebuild
 
