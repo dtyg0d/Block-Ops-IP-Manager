@@ -26,6 +26,7 @@ use std::{
 
 const APP_VERSION: &str = "3.0.0";
 const DEFAULT_START_IP: &str = "10.3.1.1";
+const RACK_MAP_START_IP: Ipv4Addr = Ipv4Addr::new(10, 3, 1, 1);
 const DEFAULT_RACK_COUNT: usize = 36;
 const SETTINGS_VERSION: u64 = 2;
 const DEFAULT_SCAN_WORKERS: usize = 64;
@@ -616,17 +617,12 @@ fn parse_ipv4(ip: &str) -> Option<Ipv4Addr> {
     ip.trim().parse::<Ipv4Addr>().ok()
 }
 
-fn rack_slot_ip(
-    start_ip: Ipv4Addr,
-    rack: usize,
-    slot: usize,
-    rack_size: usize,
-) -> Option<Ipv4Addr> {
+fn rack_slot_ip(rack: usize, slot: usize, rack_size: usize) -> Option<Ipv4Addr> {
     if rack == 0 || slot == 0 || slot > rack_size {
         return None;
     }
 
-    let octets = start_ip.octets();
+    let octets = RACK_MAP_START_IP.octets();
     let third = (octets[2] as usize).checked_add(rack - 1)?;
     let fourth = (octets[3] as usize).checked_add(slot - 1)?;
     if third > 254 || fourth > 254 {
@@ -1739,8 +1735,6 @@ impl BlockOpsApp {
         match parse_ipv4(&self.start_ip_input) {
             Some(ip) => {
                 self.next_target_ip = Some(ip);
-                self.selected_rack_slot = None;
-                self.armed_target_ip = None;
                 self.status = format!("Next target IP set to {}", ip);
                 self.log(&self.status);
             }
@@ -1749,8 +1743,7 @@ impl BlockOpsApp {
     }
 
     fn rack_slot_target_ip(&self, rack: usize, slot: usize) -> Option<String> {
-        let start_ip = parse_ipv4(&self.start_ip_input)?;
-        rack_slot_ip(start_ip, rack, slot, self.rack_size).map(|ip| ip.to_string())
+        rack_slot_ip(rack, slot, self.rack_size).map(|ip| ip.to_string())
     }
 
     fn monitor_counts(&self) -> MonitorCounts {
@@ -1791,7 +1784,7 @@ impl BlockOpsApp {
     fn arm_rack_slot(&mut self, rack: usize, slot: usize) {
         let Some(target_ip) = self.rack_slot_target_ip(rack, slot) else {
             self.status =
-                "Rack map IP rule is invalid. Check the start point and rack size.".to_string();
+                "Rack map slot is invalid. Check the rack number and rack size.".to_string();
             return;
         };
 
@@ -2050,6 +2043,13 @@ impl BlockOpsApp {
 
     fn add_miner(&mut self, current_ip: String, mac: String) {
         if self.accept_report_for_armed_slot(current_ip.clone(), mac.clone()) {
+            return;
+        }
+
+        // Only the assignment workspace owns unarmed sequential reports. A
+        // repeated rack report must not fall through after its slot is captured.
+        if self.active_view != AppView::IpAssignment {
+            self.log(&format!("Unarmed IP Report ignored from {}.", current_ip));
             return;
         }
 
@@ -3967,7 +3967,7 @@ impl BlockOpsApp {
                                 "ADDRESS SPACE",
                                 &format!(
                                     "{}  /  {} racks  /  {} slots",
-                                    self.start_ip_input, self.rack_count, self.rack_size
+                                    RACK_MAP_START_IP, self.rack_count, self.rack_size
                                 ),
                             );
                             settings_summary(
@@ -4369,7 +4369,7 @@ impl App for BlockOpsApp {
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "{}  /  {} racks  /  {} slots each",
-                                            self.start_ip_input, self.rack_count, self.rack_size
+                                            RACK_MAP_START_IP, self.rack_count, self.rack_size
                                         ))
                                         .size(10.5)
                                         .color(color_sidebar_muted()),
@@ -4934,6 +4934,20 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::*;
 
+    fn report_test_app() -> BlockOpsApp {
+        BlockOpsApp {
+            start_ip_input: DEFAULT_START_IP.to_string(),
+            next_target_ip: parse_ipv4(DEFAULT_START_IP),
+            rack_count: 36,
+            rack_size: 168,
+            auto_apply_armed_reports: false,
+            reject_wrong_subnet_reports: true,
+            listener_started: true,
+            log_path: String::new(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn normalizes_common_mac_formats() {
         assert_eq!(normalize_mac("AA-BB-CC-DD-EE-FF"), "aa:bb:cc:dd:ee:ff");
@@ -4957,23 +4971,96 @@ mod tests {
     }
 
     #[test]
-    fn rack_map_uses_the_shared_start_point() {
-        let start = Ipv4Addr::new(10, 3, 1, 1);
-        assert_eq!(
-            rack_slot_ip(start, 1, 1, 168),
-            Some(Ipv4Addr::new(10, 3, 1, 1))
-        );
-        assert_eq!(
-            rack_slot_ip(start, 36, 168, 168),
-            Some(Ipv4Addr::new(10, 3, 36, 168))
-        );
+    fn rack_map_addresses_ignore_the_assignment_start_point() {
+        let mut app = report_test_app();
+        for start in ["10.3.1.30", "10.5.4.20", "invalid"] {
+            app.start_ip_input = start.to_string();
+            assert_eq!(app.rack_slot_target_ip(1, 1).as_deref(), Some("10.3.1.1"));
+            assert_eq!(app.rack_slot_target_ip(2, 42).as_deref(), Some("10.3.2.42"));
+            assert_eq!(
+                app.rack_slot_target_ip(36, 168).as_deref(),
+                Some("10.3.36.168")
+            );
+        }
+        assert_eq!(app.rack_slot_target_ip(1, 0), None);
+        assert_eq!(app.rack_slot_target_ip(1, 169), None);
+        assert_eq!(app.rack_slot_target_ip(0, 1), None);
+    }
 
-        let shifted = Ipv4Addr::new(10, 5, 4, 20);
+    #[test]
+    fn changing_assignment_start_preserves_the_armed_rack_target() {
+        let mut app = report_test_app();
+        app.arm_rack_slot(7, 42);
+        app.start_ip_input = "10.5.4.20".to_string();
+
+        app.set_start_ip();
+
+        assert_eq!(app.next_target_ip, Some(Ipv4Addr::new(10, 5, 4, 20)));
+        assert_eq!(app.selected_rack_slot, Some((7, 42)));
+        assert_eq!(app.armed_target_ip.as_deref(), Some("10.3.7.42"));
+    }
+
+    #[test]
+    fn rack_reports_use_the_selected_subnet_and_ignore_unarmed_repeats() {
+        for (rack, current_ip, target_ip) in [
+            (2, "10.3.2.100", "10.3.2.42"),
+            (36, "10.3.36.100", "10.3.36.42"),
+        ] {
+            let mut app = report_test_app();
+            app.arm_rack_slot(rack, 42);
+            let mac = "02:00:00:00:00:01".to_string();
+
+            app.add_miner(current_ip.to_string(), mac.clone());
+            assert_eq!(app.rows.len(), 1);
+            assert_eq!(app.rows[0].target_ip, target_ip);
+            assert!(app.armed_target_ip.is_none());
+            assert!(app.wrong_subnet_popup.is_none());
+
+            app.add_miner(current_ip.to_string(), mac);
+            app.add_miner("10.3.9.100".to_string(), "02:00:00:00:00:02".to_string());
+            assert_eq!(app.rows.len(), 1);
+            assert!(app.wrong_subnet_popup.is_none());
+            assert_eq!(app.next_target_ip, Some(Ipv4Addr::new(10, 3, 1, 1)));
+        }
+    }
+
+    #[test]
+    fn rack_reports_still_block_a_different_selected_subnet() {
+        let mut app = report_test_app();
+        app.arm_rack_slot(2, 42);
+
+        app.add_miner("10.3.1.100".to_string(), "02:00:00:00:00:01".to_string());
+
+        assert!(app.rows.is_empty());
+        let popup = app
+            .wrong_subnet_popup
+            .as_ref()
+            .expect("wrong subnet must be blocked");
+        assert_eq!(popup.expected_subnet, "10.3.2");
+        assert_eq!(popup.target_ip, "10.3.2.42");
+        assert_eq!(app.armed_target_ip.as_deref(), Some("10.3.2.42"));
+    }
+
+    #[test]
+    fn sequential_reports_keep_their_own_start_point_and_subnet_guard() {
+        let mut app = report_test_app();
+        app.active_view = AppView::IpAssignment;
+        app.start_ip_input = "10.5.4.20".to_string();
+        app.set_start_ip();
+
+        app.add_miner("10.5.4.100".to_string(), "02:00:00:00:00:01".to_string());
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].target_ip, "10.5.4.20");
+        assert_eq!(app.next_target_ip, Some(Ipv4Addr::new(10, 5, 4, 21)));
+        assert!(app.wrong_subnet_popup.is_none());
+
+        app.add_miner("10.3.1.100".to_string(), "02:00:00:00:00:02".to_string());
+        assert_eq!(app.rows.len(), 1);
         assert_eq!(
-            rack_slot_ip(shifted, 2, 3, 168),
-            Some(Ipv4Addr::new(10, 5, 5, 22))
+            app.wrong_subnet_popup.as_ref().unwrap().expected_subnet,
+            "10.5.4"
         );
-        assert_eq!(rack_slot_ip(shifted, 1, 0, 168), None);
+        assert_eq!(app.next_target_ip, Some(Ipv4Addr::new(10, 5, 4, 21)));
     }
 
     #[test]

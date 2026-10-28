@@ -4,23 +4,17 @@ This build adds the first version of the Hashcore-style rack map workflow.
 
 ## New workflow
 
-1. Use dashboard mode to click a slot and view its details.
-2. Turn on `Edit mode` only when you want clicks to arm a target IP.
-3. Start the IP Report listener.
-4. Set the rack map rule:
-   - `Rack 1 Slot 1 IP`
-   - number of racks
-   - rack size, usually `156` or `168`
-5. In edit mode, click a square on the Rack Map.
-6. Press IP Report on the physical miner in that slot.
-7. The app captures the reported current IP/MAC and maps it to the clicked target IP.
-8. If `Auto apply armed reports` is enabled, the app immediately uses the existing safe apply flow.
+1. Set the number of racks and slots per rack in Settings.
+2. Click a square on the Rack Map to arm its target and start the IP Report listener.
+3. Press IP Report on the physical miner in that slot.
+4. The app captures the reported current IP/MAC and maps it to the clicked target IP.
+5. If `Apply immediately` is enabled, the app immediately uses the existing safe apply flow.
 
 ## Rack IP rule
 
-The first version uses a simple rule:
+The rack map uses a fixed rule independent of the IP Assignment start point:
 
-- Rack 1 Slot 1 is the IP typed in the map header.
+- Rack 1 Slot 1 is always `10.3.1.1`.
 - Each rack increments the third octet.
 - Each slot becomes the fourth octet.
 

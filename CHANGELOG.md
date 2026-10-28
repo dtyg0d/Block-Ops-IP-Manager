@@ -1,5 +1,13 @@
 # BlockOps Static IP Tool - Splash + Toggle Version
 
+## v3.0.1 - Rack addressing and report routing
+
+- Fixed the rack map at `10.3.<rack>.<slot>`, starting at `10.3.1.1`, independently
+  of the sequential assignment start point.
+- Kept armed rack targets intact when changing the assignment start point.
+- Ignored unarmed rack-dashboard reports so repeat packets cannot fall into the
+  sequential assignment workflow and trigger a false `10.3.1.x` subnet error.
+
 ## v3.0.0 - Operator workflow rebuild
 
 - Set the 36-rack default range to `10.3.1.1` through `10.3.36.168` and kept its editor in IP Assignment instead of duplicating it on the rack dashboard.

@@ -20,17 +20,21 @@ starting at `10.3.1.1` and ending at `10.3.36.168`.
 
 ### Rack dashboard
 
-1. Set the shared **Start point** in **IP assignment**. This is both the first sequential target and
-   Rack 1 / Slot 1; there is no second rack-base field to keep synchronized.
+1. The rack map is fixed: Rack 1 / Slot 1 is `10.3.1.1`, Rack 2 / Slot 1 is
+   `10.3.2.1`, and Rack 36 / Slot 168 is `10.3.36.168`.
 2. Select **Scan all**, type a rack number and select **Scan rack**, or start the
    live monitor.
 3. Click a physical slot to arm its expected address.
 4. Press IP Report on that miner. The listener starts automatically and the
    captured miner is assigned through the existing safe apply engine.
 
+The wrong-subnet guard checks the selected slot's subnet. Unarmed reports on the
+rack dashboard are ignored, including repeats after a slot has been captured.
+
 ### IP assignment
 
-Use the same start point to capture miners in physical order. Build or pre-check
+Set the assignment **Start point** to capture miners in physical order. It does
+not affect the rack map. Build or pre-check
 the safe plan, review every row, then apply. A later report received while an
 apply is active is queued instead of starting a competing write batch.
 

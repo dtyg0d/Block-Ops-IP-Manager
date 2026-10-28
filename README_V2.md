@@ -7,7 +7,7 @@ manager.
 
 - The default layout is 36 racks with 168 slots, labeled Rack 1 through Rack 36.
 - Previous 19-rack settings upgrade to 36 racks; other custom counts are retained.
-- One shared start point now drives Rack 1 / Slot 1 and sequential assignment.
+- The rack map always starts at `10.3.1.1`; sequential assignment has its own start point.
 - The duplicate `Rack 1, Slot 1 IP` setting was removed.
 - Direct scans over routed VPN connections do not require a relay.
 - Monitoring uses a fixed worker pool instead of creating one operating-system
