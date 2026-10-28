@@ -68,7 +68,7 @@ fn main() {
         process::exit(1);
     });
 
-    println!("BlockOps IP Report Relay 3.0.0");
+    println!("BlockOps IP Report Relay 3.0.1");
     println!("Rack listener : UDP 0.0.0.0:{listen_port}");
     println!("VPN manager   : UDP {manager}");
     println!("Keep this window open. Press Ctrl+C to stop.\n");

@@ -1,7 +1,7 @@
 @echo off
 setlocal
 title Build BlockOps Static IP Manager
-set "VERSION=3.0.0"
+set "VERSION=3.0.1"
 set "DIST=dist"
 set "MANAGER=%DIST%\BlockOps_Static_IP_Manager.exe"
 set "MANAGER_VERSIONED=%DIST%\BlockOps_Static_IP_Manager_v%VERSION%.exe"

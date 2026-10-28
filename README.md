@@ -86,8 +86,8 @@ build_release.bat
 The script runs all tests, builds both binaries, and creates:
 
 ```text
-dist\BlockOps_Static_IP_Manager_v3.0.0.exe
-dist\BlockOps_Static_IP_Manager_v3.0.0_Windows.zip
+dist\BlockOps_Static_IP_Manager_v3.0.1.exe
+dist\BlockOps_Static_IP_Manager_v3.0.1_Windows.zip
 ```
 
 The animated BlockOps intro remains embedded in the manager.

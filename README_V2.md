@@ -1,4 +1,4 @@
-# BlockOps Static IP Manager 3.0.0
+# BlockOps Static IP Manager 3.0.1
 
 Version 3 is a reliability and workflow rebuild of the rack monitor and static-IP
 manager.

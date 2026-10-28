@@ -1,4 +1,4 @@
-# BlockOps IP Report Relay 3.0.0
+# BlockOps IP Report Relay 3.0.1
 
 The miner IP Report button sends a local UDP broadcast. Routed VPNs normally do not
 carry that broadcast, so the manager cannot receive it remotely without an on-site

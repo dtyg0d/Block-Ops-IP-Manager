@@ -1,6 +1,6 @@
 [package]
 name = "blockops_static_ip_tool"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2021"
 
 [dependencies]

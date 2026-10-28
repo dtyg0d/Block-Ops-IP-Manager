@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const APP_VERSION: &str = "3.0.0";
+const APP_VERSION: &str = "3.0.1";
 const DEFAULT_START_IP: &str = "10.3.1.1";
 const RACK_MAP_START_IP: Ipv4Addr = Ipv4Addr::new(10, 3, 1, 1);
 const DEFAULT_RACK_COUNT: usize = 36;
